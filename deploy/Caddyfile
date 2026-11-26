@@ -1,0 +1,66 @@
+# The Drowned Abbey, public site: the only thing listening on the internet (80/443, HTTPS certificates automatic).
+# It serves the built web client and forwards exactly what the client calls: six core RPC routes (POST) and the
+# plugin's read-only /abbey/* routes (GET). The core's admin, wallet, explorer and profiling ports stay unreachable.
+
+abbey.skylabs.ventures {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# the core RPC routes the client uses (client/src/lib/net.ts), POST only
+	@core {
+		method POST
+		path /v1/tx /v1/query/height /v1/query/account /v1/query/fee-params /v1/query/failed-txs /v1/query/events-by-height
+	}
+	handle @core {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy 127.0.0.1:30002
+	}
+
+	# the plugin's game-state routes, all read-only, GET only
+	@plugin {
+		method GET
+		path /abbey/*
+	}
+	handle @plugin {
+		reverse_proxy 127.0.0.1:50010
+	}
+
+	# anything else under the RPC prefixes is refused, never passed through
+	handle /v1/* {
+		respond 404
+	}
+	handle /abbey/* {
+		respond 404
+	}
+
+	# the web client: hashed assets cached for good, index.html always revalidated
+	handle {
+		root * /srv/abbey
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		header /index.html Cache-Control "no-cache"
+		# the game is one page: any other path gets the page, but a missing asset is a plain 404
+		@page {
+			not path /assets/*
+			not file
+		}
+		rewrite @page /index.html
+		file_server
+	}
+
+	log {
+		output file /var/log/caddy/abbey.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+	}
+}

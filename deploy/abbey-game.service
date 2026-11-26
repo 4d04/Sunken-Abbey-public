@@ -1,0 +1,29 @@
+[Unit]
+Description=Drowned Abbey game chain (chain 2, its own root, with the abbey plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=abbey
+Group=abbey
+# the core runs plugin/abbey/pluginctl.sh relative to its checkout; the plugin process stays in this unit's cgroup
+WorkingDirectory=/opt/abbey/canopy
+Environment=CANOPY_DATA_DIR=/opt/abbey/data/nested
+Environment=ABBEY_CHAIN_ID=2
+Environment=PATH=/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+# ABBEY_PARAMS_AUTHORITY: the address allowed to sign set_params (this server's own key, made at setup)
+EnvironmentFile=/opt/abbey/abbey.env
+ExecStart=/bin/sh -c 'exec /opt/abbey/bin/canopy --data-dir /opt/abbey/data/nested --password "$(cat /opt/abbey/.password)" --nickname abbey start'
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+StandardOutput=null
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/abbey/data/nested
+
+[Install]
+WantedBy=multi-user.target

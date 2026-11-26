@@ -1,0 +1,25 @@
+[Unit]
+Description=Drowned Abbey root chain (chain 1, no plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=abbey
+Group=abbey
+WorkingDirectory=/opt/abbey/canopy
+Environment=CANOPY_DATA_DIR=/opt/abbey/data/root
+# the core only takes the keystore password as an argument; it is read from a file only abbey can open
+ExecStart=/bin/sh -c 'exec /opt/abbey/bin/canopy --data-dir /opt/abbey/data/root --password "$(cat /opt/abbey/.password)" --nickname abbey start'
+Restart=on-failure
+RestartSec=5
+# the node writes its own rotating logs under data/root/logs; stdout would only duplicate them
+StandardOutput=null
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/abbey/data/root
+
+[Install]
+WantedBy=multi-user.target

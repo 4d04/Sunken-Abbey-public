@@ -1,0 +1,30 @@
+[Unit]
+Description=Drowned Abbey game chain on Canopy testnet (nested under the testnet root, with the abbey plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=abbey
+Group=abbey
+# the core runs plugin/abbey/pluginctl.sh relative to its checkout; the plugin process stays in this unit's cgroup
+WorkingDirectory=/opt/abbey/canopy-hybrid
+Environment=CANOPY_DATA_DIR=/opt/abbey/data/testnet
+# the game's chain id on testnet, the same as testnet-chain.py --chain-id (the plugin builds and checks txs with it)
+Environment=ABBEY_CHAIN_ID=CHAIN_ID_HERE
+Environment=PATH=/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+# ABBEY_PARAMS_AUTHORITY: the address allowed to sign set_params (this server's own key, made at setup)
+EnvironmentFile=/opt/abbey/abbey.env
+ExecStart=/bin/sh -c 'exec /opt/abbey/bin/canopy-hybrid --data-dir /opt/abbey/data/testnet --password "$(cat /opt/abbey/.password)" --nickname abbey start'
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+StandardOutput=null
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/abbey/data/testnet
+
+[Install]
+WantedBy=multi-user.target

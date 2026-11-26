@@ -1,0 +1,73 @@
+# Runs every package's checks on each pull request and on pushes to main.
+# The localnet tests (client smoke, spike/client/src/m2.ts) need a running chain and stay manual.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rules:
+    name: rules (typecheck, tests, content lint, balance sim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: rules/package-lock.json
+      - run: npm ci
+        working-directory: rules
+      - run: npm run check
+        working-directory: rules
+
+  plugin:
+    name: plugin (build, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: |
+            rules/package-lock.json
+            plugin/package-lock.json
+      # the plugin imports @abbey/rules from ../rules, built
+      - run: npm ci && npm run build
+        working-directory: rules
+      - run: npm ci
+        working-directory: plugin
+      - run: npm test
+        working-directory: plugin
+
+  client:
+    name: client (typecheck, tests, web build, proto in sync)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: |
+            rules/package-lock.json
+            client/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: rules
+      - run: npm ci
+        working-directory: client
+      - run: npm run check
+        working-directory: client
+      - run: npm run build:web
+        working-directory: client
+      # client and plugin must encode the same messages: the client's generated module has to match plugin/proto
+      - name: proto module matches plugin/proto
+        run: npm run build:proto && git diff --exit-code -- src/lib/proto.js
+        working-directory: client

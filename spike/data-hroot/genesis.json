@@ -1,0 +1,80 @@
+{
+  "time": "2026-11-25 13:11:21",
+  "accounts": [
+    {
+      "address": "490ac58eb7cc4e9093a2f4099d1cac70044479f5",
+      "amount": 1000000
+    }
+  ],
+  "nonSigners": null,
+  "validators": [
+    {
+      "address": "490ac58eb7cc4e9093a2f4099d1cac70044479f5",
+      "publicKey": "8b1d396bcc0d15a93a563a0dba500bd46625c6605ba627a765c062181caec1d5cd2670e79ba0c4ce7ad5d686f408fe29",
+      "committees": [
+        1,
+        7
+      ],
+      "netAddress": "tcp://localhost",
+      "stakedAmount": 1000000000000,
+      "maxPausedHeight": 0,
+      "unstakingHeight": 0,
+      "output": "490ac58eb7cc4e9093a2f4099d1cac70044479f5",
+      "delegate": false,
+      "compound": true
+    }
+  ],
+  "params": {
+    "consensus": {
+      "blockSize": 32000000,
+      "protocolVersion": "1/0",
+      "rootChainID": 1,
+      "resetCommittee": 0,
+      "preserveNonSignerRewards": false
+    },
+    "validator": {
+      "unstakingBlocks": 2,
+      "maxPauseBlocks": 4380,
+      "doubleSignSlashPercentage": 10,
+      "nonSignSlashPercentage": 1,
+      "maxNonSign": 3,
+      "nonSignWindow": 5,
+      "maxCommittees": 15,
+      "maxCommitteeSize": 100,
+      "earlyWithdrawalPenalty": 20,
+      "delegateUnstakingBlocks": 2,
+      "minimumOrderSize": 1000000000,
+      "stakePercentForSubsidizedCommittee": 33,
+      "maxSlashPerCommittee": 15,
+      "delegateRewardPercentage": 10,
+      "buyDeadlineBlocks": 60,
+      "lockOrderFeeMultiplier": 2,
+      "minimumStakeForValidators": 0,
+      "minimumStakeForDelegates": 0,
+      "maximumDelegatesPerCommittee": 0
+    },
+    "fee": {
+      "sendFee": 10000,
+      "stakeFee": 10000,
+      "editStakeFee": 10000,
+      "unstakeFee": 10000,
+      "pauseFee": 10000,
+      "unpauseFee": 10000,
+      "changeParameterFee": 10000,
+      "daoTransferFee": 10000,
+      "certificateResultsFee": 0,
+      "subsidyFee": 10000,
+      "createOrderFee": 10000,
+      "editOrderFee": 10000,
+      "deleteOrderFee": 10000,
+      "dexLimitOrderFee": 0,
+      "dexLiquidityDeposit": 0,
+      "dexLiquidityWithdraw": 0,
+      "changeByzantineOutputFee": 10000
+    },
+    "governance": {
+      "daoRewardPercentage": 5
+    }
+  },
+  "supply": null
+}

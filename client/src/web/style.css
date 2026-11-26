@@ -1,0 +1,105 @@
+/* A terminal in a page (SPEC §8): a pinned status bar, one scrolling transcript, a prompt line. */
+:root {
+    --bg: #0b0d0c;
+    --bar: #121614;
+    --line: #26302b;
+    --fg: #d7dfd8;
+    --dim: #7d8a82;
+    --accent: #e0b84c;
+    --good: #7fc47f;
+    --warn: #e0b84c;
+    --bad: #e06c5c;
+    --blue: #7fb0d8;
+    --story: #efe2bf; /* the story, warm and bright: what you read first */
+    --math: #6f7a73; /* rolls and arithmetic: there if you look, quiet if you don't */
+    color-scheme: dark;
+    --col: 100ch; /* the column's width: the `width` command sets it */
+    --gutter: max(16px, calc((100% - var(--col)) / 2)); /* centred; `align left` sets it to 16px */
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+body { font: 15px/1.5 ui-monospace, 'SF Mono', Menlo, Consolas, monospace; display: flex; flex-direction: column; height: 100dvh; }
+
+/* status bar: the numbers that must stay in view while the story scrolls */
+#status { flex: none; display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: center; padding: 8px var(--gutter); background: var(--bar); border-bottom: 1px solid var(--line); }
+#status .title { color: var(--accent); font-weight: bold; margin-right: auto; }
+#status .push { margin-left: auto; }
+#status .who b { color: var(--accent); }
+#status button { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 1px 8px; cursor: pointer; }
+#status button:hover { border-color: var(--accent); color: var(--accent); }
+/* the party on its own row: your characters (click to take their turn), then other players fighting alongside */
+#status .party { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+#status .party .member.on { border-color: var(--accent); color: var(--accent); }
+#status .party .ally { color: var(--dim); }
+.turn { color: var(--accent); font-weight: bold; }
+.turn-ln { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 4px; } /* each turn starts a new block */
+
+/* the transcript */
+#log { flex: 1; overflow-y: auto; padding: 12px var(--gutter) 8px; overflow-wrap: anywhere; }
+.ln { white-space: pre-wrap; min-height: 1.5em; }
+.rule { color: var(--accent); white-space: pre; overflow: hidden; margin-top: 10px; }
+.title-ln { color: var(--accent); font-weight: bold; }
+.q { color: var(--fg); margin-top: 6px; }
+.echo { color: var(--blue); }
+.dim, .prose { color: var(--dim); }
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.blue { color: var(--blue); }
+.feed { color: var(--dim); }
+.feed::before { content: '» '; color: var(--blue); }
+.die { color: var(--accent); }
+
+/* an exchange: story stands out; rolls are quiet but legible; effects carry the colour of what they mean for you */
+.story { color: var(--story); }
+.story.good { color: #b9e3a6; }
+.story.bad { color: #f0a493; }
+.roll { color: var(--math); font-size: 0.9em; }
+.roll .die { color: #b9a46a; }
+.roll .outcome { font-weight: bold; color: var(--fg); }
+.roll .outcome.good { color: var(--good); }
+.roll .outcome.bad { color: var(--bad); }
+.effect.good { color: var(--good); }
+.effect.bad { color: var(--bad); }
+body.no-math .roll { display: none; }
+.die.rolling { color: var(--dim); font-weight: normal; }
+/* advantage / disadvantage: both dice shown, the one that doesn't count struck through */
+.roll .die.dropped { color: var(--dim); font-weight: normal; text-decoration: line-through; }
+.roll .edge { color: #b9a46a; }
+/* the d20 that won its contest (hit, made, first), whoever rolled it */
+.roll .die.won { color: var(--good); font-weight: bold; }
+.bar { letter-spacing: -1px; }
+.bar .full { color: var(--good); }
+.bar.mid .full { color: var(--warn); }
+.bar.low .full { color: var(--bad); }
+.bar .empty { color: #2f3833; }
+pre.map, .ln pre { margin: 0; font: inherit; line-height: 1.15; }
+pre.map .here { color: var(--accent); font-weight: bold; }
+pre.map .known { color: var(--dim); }
+#log a { color: var(--blue); }
+
+/* menus: numbered, clickable while they're the newest; grey once answered or out of date */
+.menu { margin: 4px 0; display: flex; flex-direction: column; align-items: flex-start; }
+.menu button { font: inherit; color: var(--fg); background: transparent; border: 0; padding: 1px 6px; margin-left: -6px; border-radius: 3px; text-align: left; cursor: pointer; white-space: pre-wrap; }
+.menu button:hover:not(:disabled) { background: #1a201d; color: var(--accent); }
+.menu .n { color: var(--dim); }
+.menu .note { color: var(--dim); }
+.menu.stale button { cursor: default; color: var(--dim); }
+.menu.stale button .n, .menu.stale button .note { color: #46514b; }
+.menu.stale button.picked { color: var(--fg); }
+
+/* the prompt */
+#prompt { flex: none; display: flex; gap: 8px; align-items: center; padding: 8px var(--gutter) 10px; border-top: 1px solid var(--line); background: var(--bg); }
+#plabel { color: var(--blue); white-space: pre; }
+#cmd { flex: 1; font: inherit; color: var(--fg); background: transparent; border: 0; outline: 0; caret-color: var(--accent); min-width: 0; }
+#more { position: fixed; right: max(20px, var(--gutter)); bottom: 56px; font: inherit; font-size: 13px; color: var(--bg); background: var(--accent); border: 0; border-radius: 12px; padding: 3px 10px; cursor: pointer; }
+
+@media (max-width: 520px) {
+    :root { --gutter: 12px; }
+    body { font-size: 14px; }
+    #status { padding: 6px var(--gutter); gap: 2px 12px; font-size: 13px; }
+    #status .title { display: none; }
+    #log { padding: 8px var(--gutter); }
+    .menu .note { display: block; padding-left: 4ch; }
+}
+.strip { margin: 2px 0 4px; }

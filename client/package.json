@@ -1,0 +1,32 @@
+{
+    "name": "@abbey/client",
+    "version": "0.1.0",
+    "description": "The Drowned Abbey client: a chain library (keys, signing, commit-reveal, verification) and a terminal UI",
+    "type": "module",
+    "private": true,
+    "engines": {
+        "node": ">=23.6.0"
+    },
+    "scripts": {
+        "play": "node src/tui/main.ts",
+        "typecheck": "tsc -p tsconfig.json",
+        "test": "node --test --test-reporter=spec 'test/**/*.test.ts'",
+        "smoke": "node test/smoke.ts",
+        "check": "npm run typecheck && npm test",
+        "build:proto": "pbjs -t static-module -w es6 -o src/lib/proto.js ../plugin/proto/*.proto && sed -i.bak 's|^import \\* as \\$protobuf from \"protobufjs/minimal\";|import $protobuf from \"protobufjs/minimal.js\";|' src/lib/proto.js && rm src/lib/proto.js.bak",
+        "web": "vite",
+        "build:web": "vite build"
+    },
+    "dependencies": {
+        "@abbey/rules": "file:../rules",
+        "@noble/curves": "2.0.1",
+        "@noble/hashes": "2.0.1",
+        "protobufjs": "^7.5.4"
+    },
+    "devDependencies": {
+        "@types/node": "24.10.1",
+        "protobufjs-cli": "1.1.1",
+        "typescript": "5.9.3",
+        "vite": "^6.3.5"
+    }
+}

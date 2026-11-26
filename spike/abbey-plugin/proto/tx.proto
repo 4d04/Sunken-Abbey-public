@@ -1,0 +1,120 @@
+syntax = "proto3";
+package types;
+option go_package = "github.com/canopy-network/go-plugin/contract";
+
+import "google/protobuf/any.proto";
+// Transaction represents a request or action submitted to the network like transfer assets or perform other operations
+// within the blockchain system - THIS MUST MATCH lib.Transaction EXACTLY for signing
+message Transaction {
+  // message_type: The type of the transaction like 'send' or 'stake'
+  string message_type = 1; // @gotags: json:"messageType"
+  // msg: The actual transaction message payload, which is encapsulated in a generic message format
+  google.protobuf.Any msg = 2;
+  // signature: The cryptographic signature used to verify the authenticity of the transaction
+  Signature signature = 3;
+  // created_height: The height when the transaction was created - allows 'safe pruning'
+  uint64 created_height = 4; // @gotags: json:"createdHeight"
+  // time: The timestamp when the transaction was created - used as temporal entropy to prevent hash collisions in txs
+  uint64 time = 5;
+  // fee: The fee associated with processing the transaction
+  uint64 fee = 6;
+  // memo: An optional message or note attached to the transaction
+  string memo = 7;
+  // network_id: The identity of the network the transaction is intended for
+  uint64 network_id = 8; // @gotags: json:"networkID"
+  // chain_id: The identity of the committee the transaction is intended for
+  uint64 chain_id = 9; // @gotags: json:"chainID"
+  // nonce: The sender's protocol replay-protection nonce
+  uint64 nonce = 10;
+  // NOTE: CAN EXTEND FUNCTIONALITY BY ADDING ADDITIONAL FIELDS
+  // NO CONFLICT STARTING AT FIELD = 25
+}
+
+// MessageSend is a standard transfer transaction, taking tokens from the sender and transferring
+// them to the recipient
+message MessageSend {
+  // from_address: is the sender of the funds
+  bytes from_address = 1; // @gotags: json:"fromAddress"
+  // to_address: is the recipient of the funds
+  bytes to_address = 2; // @gotags: json:"toAddress"
+  // amount: is the amount of tokens in micro-denomination (uCNPY)
+  uint64 amount = 3;
+}
+
+// FeeParams is the parameter space that defines various amounts for transaction fees
+message FeeParams {
+  // send_fee: is the fee amount (in uCNPY) for Message Send
+  uint64 send_fee = 1; // @gotags: json:"sendFee"
+  // NO CONFLICT STARTING AT FIELD = 14
+}
+
+// A Signature is a digital signature is a cryptographic "fingerprint" created with a private key,
+// allowing others to verify the authenticity and integrity of a message using the corresponding public key
+message Signature {
+  // public_key: is a cryptographic code shared openly, used to verify digital signatures
+  bytes public_key = 1; // @gotags: json:"publicKey"
+  // signature: the bytes of the signature output from a private key which may be verified with the message and public
+  bytes signature = 2;
+}
+
+// NOTE: To add new transaction types (like MessageReward, MessageFaucet), see TUTORIAL.md
+
+// ===== Abbey M0 spike messages =====
+
+// MessageFaucetClaim pays the configured faucet amount from the keyless faucet account to the signer (zero fee)
+message MessageFaucetClaim {
+  bytes address = 1;
+}
+
+// MessageSpikePayout moves gold from the keyless treasury account to the signer
+// SPIKE ONLY: proves the plugin can move native balances; real payouts come only from game rules
+message MessageSpikePayout {
+  bytes address = 1;
+  uint64 amount = 2;
+}
+
+// MessageCommitRoll locks in sha256(secret || rollId) for the signer's next roll
+message MessageCommitRoll {
+  bytes address = 1;
+  uint64 nonce = 2;
+  bytes commit = 3;
+}
+
+// MessageRevealRoll reveals the secret and resolves a d20 against the beacon of the commit block
+message MessageRevealRoll {
+  bytes address = 1;
+  uint64 nonce = 2;
+  bytes secret = 3;
+}
+
+// ===== Abbey M0 spike state records =====
+
+message BeaconRecord {
+  uint64 height = 1;
+  bytes value = 2;
+  bytes proposer = 3;
+  uint64 tx_count = 4; // @gotags: json:"txCount"
+}
+
+message RollRecord {
+  bytes address = 1;
+  uint64 nonce = 2;
+  bytes commit = 3;
+  uint64 committed_height = 4; // @gotags: json:"committedHeight"
+  uint64 expires_height = 5; // @gotags: json:"expiresHeight"
+  bytes secret = 6;
+  uint64 d20 = 7;
+  uint64 resolved_height = 8; // @gotags: json:"resolvedHeight"
+  bytes beacon = 9;
+  bool forfeited = 10;
+}
+
+message RollerRecord {
+  uint64 next_nonce = 1; // @gotags: json:"nextNonce"
+}
+
+message FaucetRecord {
+  uint64 last_claim_height = 1; // @gotags: json:"lastClaimHeight"
+  uint64 total_claimed = 2; // @gotags: json:"totalClaimed"
+  uint64 count = 3;
+}

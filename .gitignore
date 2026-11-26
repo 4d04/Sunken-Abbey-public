@@ -1,0 +1,41 @@
+# dependencies and build output
+node_modules/
+dist/
+client/dist-web/
+client/.vite/
+*.tsbuildinfo
+
+# the Canopy core checkout and binary are rebuilt by spike/setup.sh
+spike/canopy/
+spike/canopy-*/
+spike/bin/
+
+# localnet secrets: throwaway, but never committed
+spike/.localnet-password
+spike/client/.m2-authority.json
+**/keystore.json
+**/validator_key.json
+
+# localnet runtime state (chain databases, logs, peer book); genesis.json and config.json are kept
+spike/data-*/canopy/
+spike/data-*/canopy.*/
+spike/data-*/plugin/
+spike/data-*/logs/
+spike/data-*/backup/
+spike/data-*/*.log
+spike/data-*/node.pid
+spike/data-*/book.json
+spike/data-*/polls.json
+spike/data-*/proposals.json
+
+# load-test and run logs
+spike/client/*.log
+spike/client/*.raw
+
+# editors and OS
+.DS_Store
+.vscode/
+.idea/
+
+# video rig (campaign recording), local only
+video/

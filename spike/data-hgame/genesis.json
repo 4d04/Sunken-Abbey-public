@@ -1,0 +1,72 @@
+{
+  "time": "2026-11-25 13:11:21",
+  "accounts": [
+    {
+      "address": "490ac58eb7cc4e9093a2f4099d1cac70044479f5",
+      "amount": 1000000
+    },
+    {
+      "address": "cfd55e63b03ab8ea4affab919c13d0c2bfa408d0",
+      "amount": 400000000000000
+    },
+    {
+      "address": "f9c8148440b7b53dab13ce2004bba41e4c7adcb1",
+      "amount": 50000000000000
+    }
+  ],
+  "nonSigners": null,
+  "validators": [],
+  "params": {
+    "consensus": {
+      "blockSize": 32000000,
+      "protocolVersion": "1/0",
+      "rootChainID": 1,
+      "resetCommittee": 0,
+      "preserveNonSignerRewards": false
+    },
+    "validator": {
+      "unstakingBlocks": 2,
+      "maxPauseBlocks": 4380,
+      "doubleSignSlashPercentage": 10,
+      "nonSignSlashPercentage": 1,
+      "maxNonSign": 3,
+      "nonSignWindow": 5,
+      "maxCommittees": 15,
+      "maxCommitteeSize": 100,
+      "earlyWithdrawalPenalty": 20,
+      "delegateUnstakingBlocks": 2,
+      "minimumOrderSize": 1000000000,
+      "stakePercentForSubsidizedCommittee": 33,
+      "maxSlashPerCommittee": 15,
+      "delegateRewardPercentage": 10,
+      "buyDeadlineBlocks": 60,
+      "lockOrderFeeMultiplier": 2,
+      "minimumStakeForValidators": 0,
+      "minimumStakeForDelegates": 0,
+      "maximumDelegatesPerCommittee": 0
+    },
+    "fee": {
+      "sendFee": 10000,
+      "stakeFee": 10000,
+      "editStakeFee": 10000,
+      "unstakeFee": 10000,
+      "pauseFee": 10000,
+      "unpauseFee": 10000,
+      "changeParameterFee": 10000,
+      "daoTransferFee": 10000,
+      "certificateResultsFee": 0,
+      "subsidyFee": 10000,
+      "createOrderFee": 10000,
+      "editOrderFee": 10000,
+      "deleteOrderFee": 10000,
+      "dexLimitOrderFee": 0,
+      "dexLiquidityDeposit": 0,
+      "dexLiquidityWithdraw": 0,
+      "changeByzantineOutputFee": 10000
+    },
+    "governance": {
+      "daoRewardPercentage": 5
+    }
+  },
+  "supply": null
+}

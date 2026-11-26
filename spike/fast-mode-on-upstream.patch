@@ -1,0 +1,4435 @@
+From d05806e218f654a99eb973be133158ade72fad98 Mon Sep 17 00:00:00 2001
+From: andrewnguyen22 <andrewnguyen22@protonmail.com>
+Date: Thu, 5 Nov 2026 16:35:02 -0400
+Subject: [PATCH] feat: add fast deterministic BFT mode
+
+---
+ bft/bft.go                    | 717 +++++++++++++++++++++++++---------
+ bft/bft_test.go               | 465 ++++++++++++++++------
+ bft/election.go               |  67 +++-
+ bft/election_test.go          | 113 ++++++
+ bft/mock_test.go              |  44 ++-
+ bft/msg.go                    | 117 +++++-
+ bft/msg_test.go               | 151 ++++++-
+ bft/prop.go                   |  48 ++-
+ bft/prop_test.go              |  19 +-
+ controller/block.go           |  74 +++-
+ controller/block_test.go      |  33 ++
+ controller/consensus.go       |  10 +-
+ controller/consensus_test.go  |  29 ++
+ controller/controller.go      |  12 +
+ controller/controller_test.go |   6 +
+ controller/tx.go              | 111 ++++--
+ fsm/automatic.go              |  23 +-
+ fsm/automatic_test.go         |  70 +++-
+ fsm/gov.pb.go                 |  19 +-
+ fsm/gov_params.go             |   9 +-
+ fsm/gov_test.go               |  30 ++
+ fsm/state.go                  |  16 +-
+ fsm/state_test.go             |  29 +-
+ fsm/transaction.go            |  84 ++--
+ lib/.proto/gov.proto          |   2 +
+ lib/config.go                 |  76 +++-
+ lib/config_test.go            |  34 ++
+ lib/crypto/aead.go            |  10 +-
+ lib/error.go                  |  12 +
+ lib/mempool.go                |  83 ++--
+ lib/mempool_test.go           |  24 ++
+ p2p/conn.go                   |  11 +
+ p2p/encrypt.go                | 168 +++++---
+ p2p/encrypt_test.go           | 100 +++--
+ p2p/error.go                  |   5 +
+ p2p/p2p.go                    |  28 ++
+ 36 files changed, 2274 insertions(+), 575 deletions(-)
+ create mode 100644 controller/consensus_test.go
+
+diff --git a/bft/bft.go b/bft/bft.go
+index 011966cf..bf95882f 100644
+--- a/bft/bft.go
++++ b/bft/bft.go
+@@ -38,6 +38,12 @@ type BFT struct {
+ 
+ 	Controller               // reference to the Controller for callbacks like producing and validating the proposal via the plugin or gossiping commit message
+ 	ResetBFT   chan ResetBFT // trigger that resets the BFT due to a new Target block or a new Canopy block
++
++	advanceBFT   chan struct{} // edge-triggered notification that the current phase has enough data to advance
++	futureMsgs   []*Message    // messages that arrived before the preceding block reset
++	futureHeight uint64
++	futureBytes  int
++
+ 	syncing    *atomic.Bool  // if chain for this committee is currently catching up to latest height
+ 	phase      atomic.Int32  // atomic mirror of View.Phase for external readers
+ 	round      atomic.Uint64 // atomic mirror of View.Round for external readers
+@@ -46,14 +52,21 @@ type BFT struct {
+ 	forcedRound        uint64    // admin-scheduled round; 0 means none
+ 	forcedRoundAt      time.Time // earliest time at which forcedRound may be entered
+ 	forcedTimeoutRound *uint64   // pending/active timeout round override
++	forceRoundTimer    *time.Timer
++	roundZeroNewView   bool // a lock-preserving committee reset must exchange locks before proposing
+ 
+ 	PhaseTimer *time.Timer // ensures the node waits for a configured duration (Round x phaseTimeout) to allow for full voter participation
+ 
++	roundDeadline time.Time // coordinated absolute deadline for the current round
++	// A manual round jump starts a coordinated timeout schedule at the requested time, with these fields mapping its actual round to the requested backoff level.
++	roundScheduleStart   uint64
++	timeoutScheduleStart uint64
++
+ 	PublicKey    []byte             // self consensus public key
+ 	PrivateKey   crypto.PrivateKeyI // self consensus private key
+ 	Config       lib.Config         // self configuration
+ 	Metrics      *lib.Metrics       // telemetry
+-	BFTStartTime time.Time          // start time of BFT for this height
++	BFTStartTime time.Time          // anchor of the active coordinated round schedule
+ 	log          lib.LoggerI        // logging
+ }
+ 
+@@ -86,8 +99,10 @@ func New(c lib.Config, valKey crypto.PrivateKeyI, rootHeight, height uint64, con
+ 		log:               l,
+ 		Controller:        con,
+ 		ResetBFT:          make(chan ResetBFT, 100),
++		advanceBFT:        make(chan struct{}, 1),
+ 		syncing:           con.Syncing(),
+ 		PhaseTimer:        lib.NewTimer(),
++		forceRoundTimer:   lib.NewTimer(),
+ 		VDFService:        vdf,
+ 		Metrics:           m,
+ 		HighVDF:           new(crypto.VDF),
+@@ -115,6 +130,11 @@ func (b *BFT) ProposalVoteDeadlineUnixMilli() int64 {
+ 	return b.deadlineMs.Load()
+ }
+ 
++// usesDeterministicProposers() reports whether the configured proposer mode is deterministic.
++func (b *BFT) usesDeterministicProposers() bool {
++	return b != nil && b.Config.ConsensusConfig.UsesDeterministicProposers()
++}
++
+ // Start() initiates the HotStuff BFT service.
+ // - Phase Timeout ensures the node waits for a configured duration (Round x phaseTimeout) to allow for full voter participation
+ // This design balances synchronization speed during adverse conditions with maximizing voter participation under normal conditions
+@@ -122,19 +142,25 @@ func (b *BFT) ProposalVoteDeadlineUnixMilli() int64 {
+ //   - (a) Canopy chainId <committeeSet changed, reset but keep locks to prevent conflicting validator sets between peers during a view change>
+ //   - (b) Target chainId <mission accomplished, move to next height>
+ func (b *BFT) Start() {
+-	var err lib.ErrorI
+-	// load the committee from the base chain
+-	b.ValidatorSet, err = b.Controller.LoadCommittee(b.LoadRootChainId(b.ChainHeight()), b.Controller.RootChainHeight())
+-	if err != nil {
+-		b.log.Warn(err.Error())
+-	}
+-	// load the committee data
+-	b.CommitteeData, err = b.Controller.LoadCommitteeData()
+-	if err != nil {
+-		b.log.Warn(err.Error())
+-	}
++	// Publish the initial root height, validator set, and committee metadata as one snapshot, just as on later height/round refreshes.
++	b.RefreshRootChainInfo()
+ 	for {
+ 		select {
++		case <-b.forceRoundTimer.C:
++			func() {
++				b.Controller.Lock()
++				defer b.Controller.Unlock()
++				b.applyForcedRound()
++			}()
++
++		// Consensus messages drive optimistic phase advancement; timers detect missing proposals, votes, and asynchronous peers.
++		case <-b.advanceBFT:
++			func() {
++				b.Controller.Lock()
++				defer b.Controller.Unlock()
++				b.advanceReadyPhases()
++			}()
++
+ 		// EXECUTE PHASE
+ 		// - This triggers when the phase's sleep time has expired, indicating that all expected messages for this phase should have already been received
+ 		case <-b.PhaseTimer.C:
+@@ -144,40 +170,60 @@ func (b *BFT) Start() {
+ 				defer b.Controller.Unlock()
+ 				// Update BFT metrics
+ 				defer b.Metrics.UpdateBFTMetrics(b.Height, b.RootHeight, b.LoadRootChainId(b.Height), b.Round, b.Phase, startTime)
+-				// handle the phase
+-				b.HandlePhase()
++				// if using VRF mode -> handle each phase
++				if !b.usesDeterministicProposers() {
++					b.HandlePhase()
++					return
++				}
++				// Hold a ready commit until its agreed timestamp; every other timer expiry is the single deadline for the entire round.
++				if b.Phase == CommitProcess && b.GetProposal() != nil {
++					b.HandlePhase()
++					return
++				}
++				b.RoundInterrupt()
+ 			}()
+ 
+ 		// RESET BFT
+ 		// - This triggers when receiving a new Commit Block (QC) from either root-chainId (a) or the Target-ChainId (b)
+ 		case resetBFT := <-b.ResetBFT:
+-			var processTime time.Duration
++			var deferred []*Message
+ 			func() {
+ 				b.Controller.Lock()
+ 				defer b.Controller.Unlock()
+-				processTime = validProcessTime(resetBFT.StartTime, time.Duration(b.Config.BlockTimeMS())*time.Millisecond)
+-				if processTime != 0 {
+-					b.log.Infof("Using included timestamp to calculate process time: %s", resetBFT.StartTime.Format(time.StampMilli))
+-				}
+-				// if is a root-chain update reset back to round 0 but maintain locks to prevent 'fork attacks'
+-				// else increment the height and don't maintain locks
+-				if !resetBFT.IsRootChainUpdate {
++				if resetBFT.IsRootChainUpdate {
++					b.log.Info("Reset BFT (NEW_COMMITTEE)")
++				} else {
+ 					b.log.Info("Reset BFT (NEW_HEIGHT)")
+-					b.NewHeight(false)
+-					b.SetWaitTimers(time.Duration(b.Config.NewHeightTimeoutMs)*time.Millisecond, processTime)
+-					b.BFTStartTime = time.Now()
+-					b.deadlineMs.Store(b.BFTStartTime.Add(time.Duration(b.Config.BlockTimeMS()*3) * time.Millisecond).UnixMilli())
++				}
++				b.NewHeight(resetBFT.IsRootChainUpdate)
++				if b.usesDeterministicProposers() {
++					b.SetHeightAnchor(resetBFT.StartTime)
++					b.StartRound()
++					if !resetBFT.IsRootChainUpdate {
++						b.deadlineMs.Store(b.RoundDeadline(2).UnixMilli())
++					}
+ 				} else {
+-					b.log.Info("Reset BFT (NEW_COMMITTEE)")
+-					//if b.LoadIsOwnRoot() {
+-					b.NewHeight(true)
+-					//} else if b.Round != 0 {
+-					//	b.NewHeight(true)
+-					// set the wait timers to start consensus
++					processTime := validProcessTime(resetBFT.StartTime, time.Duration(b.Config.BlockTimeMS())*time.Millisecond)
+ 					b.SetWaitTimers(time.Duration(b.Config.NewHeightTimeoutMs)*time.Millisecond, processTime)
+-					//}
++					if !resetBFT.IsRootChainUpdate {
++						b.BFTStartTime = time.Now()
++						b.deadlineMs.Store(b.BFTStartTime.Add(time.Duration(b.Config.BlockTimeMS()*3) * time.Millisecond).UnixMilli())
++					}
+ 				}
++				deferred = b.takeFutureMessages(b.Height)
+ 			}()
++			// Replay a next-height consensus message that overtook its finalized block only after the atomic height/committee reset is visible.
++			for _, msg := range deferred {
++				if err := b.HandleMessage(msg); err != nil {
++					b.log.Errorf("Handling deferred consensus message failed with err: %s", err.Error())
++					continue
++				}
++				if b.usesDeterministicProposers() {
++					b.Controller.Lock()
++					b.advanceReadyPhases()
++					b.Controller.Unlock()
++				}
++			}
+ 		}
+ 	}
+ }
+@@ -189,6 +235,39 @@ func validProcessTime(start time.Time, maxAge time.Duration) time.Duration {
+ 	return 0
+ }
+ 
++// advanceReadyPhases() executes every phase made ready by in-memory messages while the caller holds the controller lock.
++func (b *BFT) advanceReadyPhases() {
++	if round, ok := b.TimeoutQuorumRound(); ok {
++		b.GossipTimeoutQuorum(round)
++		if round >= b.Round {
++			b.EnterRound(round + 1)
++		}
++	}
++	if round, ok := b.TimeoutCatchUpRound(); ok && round > b.Round {
++		b.log.Infof("Timeout evidence advanced local round to %d", round)
++		b.EnterRound(round)
++	}
++	for b.PhaseHas23Maj() {
++		phase := b.Phase
++		b.HandlePhase()
++		// CommitProcess waits for the block listener to persist and reset the height; this also guards against accidental phase-handler loops.
++		if b.Phase == phase {
++			return
++		}
++	}
++}
++
++// SignalPhaseAdvance() wakes the consensus loop to recheck phase readiness; duplicate signals are coalesced.
++func (b *BFT) SignalPhaseAdvance() {
++	if !b.usesDeterministicProposers() {
++		return
++	}
++	select {
++	case b.advanceBFT <- struct{}{}:
++	default:
++	}
++}
++
+ // HandlePhase() is the main BFT Phase stepping loop
+ func (b *BFT) HandlePhase() {
+ 	stopTimers := func() { b.PhaseTimer.Stop() }
+@@ -204,7 +283,6 @@ func (b *BFT) HandlePhase() {
+ 		stopTimers()
+ 		return
+ 	}
+-	// measure process time to have the most accurate timer timeouts
+ 	startTime := time.Now()
+ 	switch b.Phase {
+ 	case Election:
+@@ -232,63 +310,55 @@ func (b *BFT) HandlePhase() {
+ 	b.SetTimerForNextPhase(time.Since(startTime))
+ }
+ 
+-// StartElectionPhase() begins the ElectionPhase after the CommitProcess (normal) or Pacemaker (previous Round failure) timeouts
+-// ELECTION PHASE:
+-// - Replicas run the Cumulative Distribution Function and a 'practical' Verifiable Random Function
+-// - If they are a candidate they send the VRF Out to the replicas
++// StartElectionPhase deterministically selects the leader from the validator set and current view without sending a network message.
+ func (b *BFT) StartElectionPhase() {
+ 	b.log.Info(b.View.ToString())
+-	// retrieve Validator object from the ValidatorSet
+-	selfValidator, err := b.ValidatorSet.GetValidator(b.PublicKey)
+-	if err != nil {
+-		b.log.Error(err.Error())
++	if !b.usesDeterministicProposers() {
++		selfValidator, err := b.ValidatorSet.GetValidator(b.PublicKey)
++		if err != nil {
++			b.log.Error(err.Error())
++			return
++		}
++		lastProposers, err := b.LoadLastProposers(b.RootHeight)
++		if err != nil {
++			b.log.Error(err.Error())
++			return
++		}
++		b.SortitionData = &lib.SortitionData{
++			LastProposerAddresses: lastProposers.Addresses,
++			RootHeight:            b.RootHeight, Height: b.Height, Round: b.Round,
++			TotalValidators: b.ValidatorSet.NumValidators,
++			TotalPower:      b.ValidatorSet.TotalPower, VotingPower: selfValidator.VotingPower,
++		}
++		_, vrf, isCandidate := Sortition(&SortitionParams{SortitionData: b.SortitionData, PrivateKey: b.PrivateKey})
++		if isCandidate {
++			b.log.Info("Self is a leader candidate 🗳️")
++			b.SendToReplicas(b.ValidatorSet, &Message{Header: b.View.Copy(), Vrf: vrf})
++		}
+ 		return
+ 	}
+-	lastProposers, err := b.LoadLastProposers(b.RootHeight)
+-	if err != nil {
+-		b.log.Error(err.Error())
++	b.ProposerKey = SelectProposerWeightedRoundRobin(b.View, b.ValidatorSet.ValidatorSet, b.ValidatorSet.TotalPower)
++	if len(b.ProposerKey) == 0 {
++		b.log.Error("unable to select deterministic proposer")
+ 		return
+ 	}
+-	// initialize the sortition parameters
+-	b.SortitionData = &lib.SortitionData{
+-		LastProposerAddresses: lastProposers.Addresses,      // LastProposers ensures defense against Grinding Attacks
+-		RootHeight:            b.RootHeight,                 // the height of the root ensures a unique sortition for each root height
+-		Height:                b.Height,                     // height ensures a unique sortition seed for each height
+-		Round:                 b.Round,                      // round ensures a unique sortition seed for each round
+-		TotalValidators:       b.ValidatorSet.NumValidators, // validator count is required for CDF
+-		TotalPower:            b.ValidatorSet.TotalPower,    // total power between all validators is required for CDF
+-		VotingPower:           selfValidator.VotingPower,    // self voting power is required for CDF
+-	}
+-	// SORTITION (CDF + VRF)
+-	_, vrf, isCandidate := Sortition(&SortitionParams{
+-		SortitionData: b.SortitionData,
+-		PrivateKey:    b.PrivateKey,
+-	})
+-	// if is a possible proposer candidate, then send the VRF to other Replicas for the ElectionVote
+-	if isCandidate {
+-		b.log.Info("Self is a leader candidate 🗳️")
+-		b.SendToReplicas(b.ValidatorSet, &Message{
+-			Header: b.View.Copy(),
+-			Vrf:    vrf,
+-		})
+-	}
++	b.log.Infof("Selected deterministic proposer %s", lib.BytesToTruncatedString(b.ProposerKey))
++	// ElectionVote now acts only as a new-view vote carrying locks and evidence, so it needs no candidate collection window.
++	b.SignalPhaseAdvance()
+ }
+ 
+ // StartElectionVotePhase() begins the ElectionVotePhase after the ELECTION phase timeout
+ // ELECTION-VOTE PHASE:
+-// - Replicas review messages from Candidates and determine the 'Leader' by the highest VRF
+-// - If no Candidate messages received, fallback to stake weighted random 'Leader' selection
++// - Replicas use the leader already derived from the validator set and view
+ // - Replicas send a signed (aggregable) ELECTION vote to the Leader (Proposer)
+ // - With this vote, the Replica attaches any Byzantine evidence or 'Locked' QC they have collected as well as their VDF output
+ func (b *BFT) StartElectionVotePhase() {
+ 	b.log.Info(b.View.ToString())
+-	// get the candidates from messages received
+-	candidates := b.GetElectionCandidates()
+-	if len(candidates) == 0 {
+-		b.log.Warn("No election candidates, falling back to weighted pseudorandom")
++	if !b.usesDeterministicProposers() {
++		b.ProposerKey = SelectProposerFromCandidates(b.GetElectionCandidates(), b.SortitionData, b.ValidatorSet.ValidatorSet)
++	} else if len(b.ProposerKey) == 0 {
++		b.ProposerKey = SelectProposerWeightedRoundRobin(b.View, b.ValidatorSet.ValidatorSet, b.ValidatorSet.TotalPower)
+ 	}
+-	// select Proposer (set is required for self-send)
+-	b.ProposerKey = SelectProposerFromCandidates(candidates, b.SortitionData, b.ValidatorSet.ValidatorSet)
+ 	defer func() { b.ProposerKey = nil }()
+ 	if b.SelfIsProposer() {
+ 		b.log.Info("Voting SELF as the proposer")
+@@ -321,7 +391,19 @@ func (b *BFT) StartElectionVotePhase() {
+ // - Leader creates a PROPOSE message from the Proposal and justifies the message with the +2/3 threshold multi-signature
+ func (b *BFT) StartProposePhase() {
+ 	b.log.Info(b.View.ToString())
++	if b.usesDeterministicProposers() {
++		if len(b.ProposerKey) == 0 {
++			b.ProposerKey = SelectProposerWeightedRoundRobin(b.View, b.ValidatorSet.ValidatorSet, b.ValidatorSet.TotalPower)
++		}
++		if !b.SelfIsProposer() {
++			return
++		}
++	}
+ 	vote, as, err := b.GetMajorityVote()
++	if err != nil && b.usesDeterministicProposers() && b.Round == 0 && !b.roundZeroNewView {
++		// Accept an already collected new-view quorum for compatibility with in-flight messages, but never wait for it on the active round-zero path.
++		vote, as, err = b.roundZeroProposerProof()
++	}
+ 	if err != nil {
+ 		return
+ 	}
+@@ -342,6 +424,10 @@ func (b *BFT) StartProposePhase() {
+ 	} else {
+ 		b.Block, b.Results = b.HighQC.Block, b.HighQC.Results
+ 	}
++	// Adopt a later target slot before broadcasting so an expired round timer cannot race the proposer's self-delivered proposal.
++	if b.usesDeterministicProposers() {
++		b.extendRoundDeadlineFromProposal(b.Block)
++	}
+ 	// send PROPOSE message to the replicas
+ 	b.SendToReplicas(b.ValidatorSet, &Message{
+ 		Header: b.View.Copy(),
+@@ -360,6 +446,29 @@ func (b *BFT) StartProposePhase() {
+ 	})
+ }
+ 
++// roundZeroProposerProof() creates a one-signer proof for a fresh height; committee resets and higher rounds still require a +2/3 new-view certificate.
++func (b *BFT) roundZeroProposerProof() (*Message, *lib.AggregateSignature, lib.ErrorI) {
++	header := b.View.Copy()
++	header.Phase = ElectionVote // retained wire value; semantically proposer proof/new-view
++	vote := &Message{Qc: &QC{Header: header, ProposerKey: b.PublicKey}}
++	if err := vote.Sign(b.PrivateKey); err != nil {
++		return nil, nil, err
++	}
++	_, idx, errI := b.ValidatorSet.GetValidatorAndIdx(b.PublicKey)
++	if errI != nil {
++		return nil, nil, errI
++	}
++	multiKey := b.ValidatorSet.MultiKey.Copy()
++	if err := multiKey.AddSigner(vote.Signature.Signature, idx); err != nil {
++		return nil, nil, ErrUnableToAddSigner(err)
++	}
++	signature, err := multiKey.AggregateSignatures()
++	if err != nil {
++		return nil, nil, ErrAggregateSignature(err)
++	}
++	return vote, &lib.AggregateSignature{Signature: signature, Bitmap: multiKey.Bitmap()}, nil
++}
++
+ // StartProposeVotePhase() begins the ProposeVote after the PROPOSE phase timeout
+ // PROPOSE-VOTE PHASE:
+ // - Replica reviews the message from the Leader by validating the justification (+2/3 multi-sig) proving that they are in-fact the leader
+@@ -405,6 +514,10 @@ func (b *BFT) StartProposeVotePhase() {
+ 		b.RoundInterrupt()
+ 		return
+ 	}
++	// Adopt a validated proposal's later signed timestamp as the shared deadline while leaving the round-zero failure path at 500 ms for invalid or missing proposals.
++	if b.usesDeterministicProposers() {
++		b.extendRoundDeadlineFromProposal(msg.Qc.Block)
++	}
+ 	// Store the proposal data to enforce consistency during this voting round
+ 	// Note: This is not the same as a `lock`, since a `lock` would keep the data even after the round changes
+ 	b.Block, b.Results = msg.Qc.Block, msg.Qc.Results
+@@ -424,6 +537,32 @@ func (b *BFT) StartProposeVotePhase() {
+ 	})
+ }
+ 
++// extendRoundDeadlineFromProposal() adopts a locally produced or live-validated proposal timestamp when construction moves beyond the nominal round.
++func (b *BFT) extendRoundDeadlineFromProposal(blockBytes []byte) {
++	timestamp, err := proposalTimestamp(blockBytes)
++	if err != nil {
++		return
++	}
++	proposalTime := time.UnixMicro(int64(timestamp))
++	if !proposalTime.After(b.roundDeadline) {
++		return
++	}
++	b.roundDeadline = proposalTime
++	b.SetWaitTimers(time.Until(b.roundDeadline))
++}
++
++// proposalTimestamp() decodes and returns a proposal block's timestamp.
++func proposalTimestamp(blockBytes []byte) (uint64, lib.ErrorI) {
++	block := new(lib.Block)
++	if err := lib.Unmarshal(blockBytes, block); err != nil {
++		return 0, err
++	}
++	if block.BlockHeader == nil {
++		return 0, lib.ErrNilBlockHeader()
++	}
++	return block.BlockHeader.Time, nil
++}
++
+ // StartPrecommitPhase() begins the PrecommitPhase after the PROPOSE-VOTE phase timeout
+ // PRECOMMIT PHASE:
+ // - Leader reviews the collected Replica PROPOSE votes (votes signing off on the validity of the Leader's Proposal)
+@@ -502,6 +641,19 @@ func (b *BFT) StartCommitPhase() {
+ 	if !b.SelfIsProposer() {
+ 		return
+ 	}
++	var timestamp uint64
++	if b.usesDeterministicProposers() {
++		// Use the agreed block timestamp as the next-height pacing anchor.
++		var err lib.ErrorI
++		timestamp, err = proposalTimestamp(b.Block)
++		if err != nil {
++			b.log.Error(err.Error())
++			b.RoundInterrupt()
++			return
++		}
++	} else {
++		timestamp = uint64(time.Now().Add(b.WaitTime(Commit, b.Round)).UnixMicro())
++	}
+ 	// get the VoteSet and aggregate signature that has +2/3 majority (by voting power) signatures from Replicas
+ 	vote, as, err := b.GetMajorityVote()
+ 	if err != nil {
+@@ -519,7 +671,7 @@ func (b *BFT) StartCommitPhase() {
+ 			ProposerKey: b.ProposerKey,
+ 			Signature:   as,
+ 		},
+-		Timestamp: uint64(time.Now().Add(b.WaitTime(Commit, b.Round)).UnixMicro()),
++		Timestamp: timestamp,
+ 	})
+ }
+ 
+@@ -542,6 +694,20 @@ func (b *BFT) StartCommitProcessPhase() {
+ 		b.RoundInterrupt()
+ 		return
+ 	}
++	timestamp := msg.Timestamp
++	if b.usesDeterministicProposers() {
++		var err lib.ErrorI
++		timestamp, err = proposalTimestamp(b.Block)
++		if err != nil {
++			b.log.Error(err.Error())
++			b.RoundInterrupt()
++			return
++		}
++		if wait := time.Until(time.UnixMicro(int64(timestamp))); wait > 0 {
++			b.SetWaitTimers(wait)
++			return
++		}
++	}
+ 	msg.Qc.Block, msg.Qc.Results = b.Block, b.Results
+ 	// preset the Byzantine Evidence for the next height
+ 	b.ByzantineEvidence = &ByzantineEvidence{
+@@ -550,11 +716,12 @@ func (b *BFT) StartCommitProcessPhase() {
+ 	// non-blocking
+ 	go func() {
+ 		// send the block to self for committing
+-		b.SelfSendBlock(msg.Qc, msg.Timestamp)
+-		// wait to allow for CommitProcess to finish
+-		<-time.After(time.Duration(b.Config.CommitTimeoutMS) * time.Millisecond)
+-		// gossip committed block message to peers
+-		b.GossipBlock(msg.Qc, b.PublicKey, msg.Timestamp)
++		b.SelfSendBlock(msg.Qc, timestamp)
++		if !b.usesDeterministicProposers() {
++			<-time.After(time.Duration(b.Config.CommitTimeoutMS) * time.Millisecond)
++		}
++		// Gossip the finalized block immediately so a replica that missed the live COMMIT can catch up before the next deadline.
++		b.GossipBlock(msg.Qc, b.PublicKey, timestamp)
+ 	}()
+ }
+ 
+@@ -562,65 +729,49 @@ func (b *BFT) StartCommitProcessPhase() {
+ // ROUND-INTERRUPT:
+ // - Replica sends current View message to other replicas (Pacemaker vote)
+ func (b *BFT) RoundInterrupt() {
++	deterministic := b.usesDeterministicProposers()
++	if !deterministic {
++		b.Config.RoundInterruptTimeoutMS = b.msLeftInRound()
++		b.log.Warnf("Starting next round in %.2f secs", (time.Duration(b.Config.RoundInterruptTimeoutMS) * time.Millisecond).Seconds())
++	} else if !b.roundDeadline.IsZero() {
++		if wait := time.Until(b.roundDeadline); wait > 0 {
++			b.log.Warnf("Round %d failed; preserving coordinated deadline in %.2f secs", b.Round, wait.Seconds())
++			b.SetWaitTimers(wait)
++			return
++		}
++		b.log.Warnf("Round %d deadline reached; broadcasting timeout vote", b.Round)
++	}
+ 	_ = b.VDFService.Finish() // stop VDF service because the block hash that was being used as a seed will change
+-	b.Config.RoundInterruptTimeoutMS = b.msLeftInRound()
+-	b.log.Warnf("Starting next round in %.2f secs", (time.Duration(b.Config.RoundInterruptTimeoutMS) * time.Millisecond).Seconds())
+ 	b.Phase = RoundInterrupt
+ 	b.phase.Store(int32(b.Phase))
+ 	b.BlockResult = nil
+ 	b.VDFCache = []*Message{}
+ 	b.ResetFSM()
++	if deterministic {
++		// Keep relaying the highest timeout certificate so an advanced validator does not strand peers that missed one of its votes.
++		if round, ok := b.TimeoutQuorumRound(); ok {
++			b.GossipTimeoutQuorum(round)
++		}
++	}
+ 	// send pacemaker message
+ 	b.SendToReplicas(b.ValidatorSet, &Message{
+ 		Qc: &lib.QuorumCertificate{
+ 			Header: b.View.Copy(),
+ 		},
+ 	})
++	if deterministic {
++		// Re-broadcast while waiting for a timeout quorum; this timer never advances the round by itself.
++		b.SetWaitTimers(time.Duration(b.Config.RoundInterruptTimeoutMS) * time.Millisecond)
++	}
+ }
+ 
+ // Pacemaker() begins the Pacemaker process after ROUND-INTERRUPT timeout occurs
+-// - sets the highest round that +2/3rds majority of replicas have seen
++// - joins the highest round supported by more than one third of voting power
+ func (b *BFT) Pacemaker() bool {
+ 	b.log.Info(b.View.ToString())
+-	forcedRound := b.forcedRound
+-	if forcedRound != 0 {
+-		if wait := time.Until(b.forcedRoundAt); wait > 0 {
+-			b.SetWaitTimers(wait, 0)
+-			return false
+-		}
+-		b.Round = forcedRound - 1
+-		b.forcedRound = 0
+-	}
+ 	b.NewRound(false)
+-	if forcedRound != 0 {
+-		b.log.Warnf("Forced consensus round to %d", b.Round)
+-		return true
+-	}
+-	// sort the pacemaker votes from the highest Round to the lowest Round
+-	var sortedVotes []*Message
+-	for _, vote := range b.PacemakerMessages {
+-		sortedVotes = append(sortedVotes, vote)
+-	}
+-	sort.Slice(sortedVotes, func(i, j int) bool {
+-		return sortedVotes[i].Qc.Header.Round >= sortedVotes[j].Qc.Header.Round
+-	})
+-	// loop from the highest Round to the lowest Round, summing the voting power until reaching round 0 or getting +2/3rds majority
+-	totalVotedPower, pacemakerRound := uint64(0), uint64(0)
+-	for _, vote := range sortedVotes {
+-		validator, err := b.ValidatorSet.GetValidator(vote.Signature.PublicKey)
+-		if err != nil {
+-			b.log.Warn(err.Error())
+-			continue
+-		}
+-		totalVotedPower += validator.VotingPower
+-		// if totalVotePower > 1/3, it's safe to advance to that round
+-		if totalVotedPower > b.ValidatorSet.TotalPower/3 {
+-			pacemakerRound = vote.Qc.Header.Round // set the highest round where +1/3rds have been
+-			break
+-		}
+-	}
+ 	// if +1/3rd Round is larger than local Round - advance to the +1/3rd Round to better join the Majority
+-	if pacemakerRound > b.Round {
++	if pacemakerRound, ok := b.TimeoutCatchUpRound(); ok && pacemakerRound > b.Round {
+ 		b.log.Infof("Pacemaker peers set round: %d", pacemakerRound)
+ 		b.Round = pacemakerRound
+ 		b.round.Store(b.Round)
+@@ -628,8 +779,7 @@ func (b *BFT) Pacemaker() bool {
+ 	return true
+ }
+ 
+-// ScheduleForceRound enters the exact target round at the first pacemaker
+-// boundary at or after at. The caller must hold the Controller lock.
++// ScheduleForceRound enters the exact target round at the requested time while the caller holds the Controller lock.
+ func (b *BFT) ScheduleForceRound(round uint64, at time.Time, timeoutRound *uint64) error {
+ 	if round <= b.Round {
+ 		return fmt.Errorf("target round %d must be greater than current round %d", round, b.Round)
+@@ -638,32 +788,154 @@ func (b *BFT) ScheduleForceRound(round uint64, at time.Time, timeoutRound *uint6
+ 	b.forcedRoundAt = at
+ 	b.forcedTimeoutRound = timeoutRound
+ 	b.log.Warnf("Scheduled forced consensus round %d at %s", round, at.Format(time.RFC3339Nano))
+-	if b.Phase == Pacemaker {
+-		b.SetWaitTimers(time.Until(at), 0)
+-	}
++	lib.ResetTimer(b.forceRoundTimer, time.Until(at))
+ 	return nil
+ }
+ 
++// applyForcedRound() handles the administrative recovery timer independently of the normal phase timer.
++func (b *BFT) applyForcedRound() {
++	round := b.forcedRound
++	if round == 0 {
++		return
++	}
++	if wait := time.Until(b.forcedRoundAt); wait > 0 {
++		lib.ResetTimer(b.forceRoundTimer, wait)
++		return
++	}
++	b.forcedRound = 0
++	if round <= b.Round {
++		b.forcedTimeoutRound = nil
++		return
++	}
++	if b.usesDeterministicProposers() {
++		timeoutRound := round
++		if b.forcedTimeoutRound != nil {
++			timeoutRound = *b.forcedTimeoutRound
++		}
++		// Re-anchor deadlines at the shared activation time while keeping the actual round and requested timeout backoff indices separate.
++		b.BFTStartTime = b.forcedRoundAt
++		b.roundScheduleStart = round
++		b.timeoutScheduleStart = timeoutRound
++	}
++	b.log.Warnf("Forced consensus round to %d", round)
++	b.EnterRound(round)
++}
++
+ // PacemakerMessages is a collection of 'View' messages keyed by each Replica's public key
+ // These messages help Replicas synchronize their Rounds more effectively during periods of instability or failure
+ type PacemakerMessages map[string]*Message // [ public_key_string ] -> View message
+ 
++const maxPacemakerMessagesPerSigner = 2
++
+ // AddPacemakerMessage() adds the 'View' message to the list (keyed by public key string)
+ func (b *BFT) AddPacemakerMessage(msg *Message) (err lib.ErrorI) {
+ 	b.Controller.Lock()
+ 	defer b.Controller.Unlock()
+-	b.PacemakerMessages[lib.BytesToString(msg.Signature.PublicKey)] = msg
++	key := lib.BytesToString(msg.Signature.PublicKey)
++	if b.usesDeterministicProposers() {
++		key = fmt.Sprintf("%d/%s", msg.Qc.Header.Round, key)
++	}
++	b.PacemakerMessages[key] = msg
++	if b.usesDeterministicProposers() {
++		// Retain each signer's two newest authenticated timeout votes to support catch-up and relay the preceding certificate with bounded memory.
++		oldestKey, oldestRound, count := key, msg.Qc.Header.Round, 0
++		for storedKey, stored := range b.PacemakerMessages {
++			if !bytes.Equal(stored.Signature.PublicKey, msg.Signature.PublicKey) {
++				continue
++			}
++			count++
++			if stored.Qc.Header.Round < oldestRound {
++				oldestKey, oldestRound = storedKey, stored.Qc.Header.Round
++			}
++		}
++		if count > maxPacemakerMessagesPerSigner {
++			delete(b.PacemakerMessages, oldestKey)
++		}
++	}
++	b.SignalPhaseAdvance()
+ 	return
+ }
+ 
++// TimeoutQuorumRound() returns the highest exact round with timeout messages signed by +2/3 of voting power.
++func (b *BFT) TimeoutQuorumRound() (uint64, bool) {
++	powerByRound := make(map[uint64]uint64)
++	for _, msg := range b.PacemakerMessages {
++		validator, err := b.ValidatorSet.GetValidator(msg.Signature.PublicKey)
++		if err != nil {
++			continue
++		}
++		round := msg.Qc.Header.Round
++		powerByRound[round] += validator.VotingPower
++	}
++	highest, found := uint64(0), false
++	for round, power := range powerByRound {
++		if power >= b.ValidatorSet.MinimumMaj23 && (!found || round > highest) {
++			highest, found = round, true
++		}
++	}
++	return highest, found
++}
++
++// TimeoutCatchUpRound() returns the highest round supported by more than one third of voting power at that round or above, counting each signer once.
++func (b *BFT) TimeoutCatchUpRound() (uint64, bool) {
++	messages := make([]*Message, 0, len(b.PacemakerMessages))
++	for _, msg := range b.PacemakerMessages {
++		messages = append(messages, msg)
++	}
++	sort.Slice(messages, func(i, j int) bool { return messages[i].Qc.Header.Round > messages[j].Qc.Header.Round })
++	seen := make(map[string]struct{}, len(messages))
++	var power uint64
++	for _, msg := range messages {
++		signer := lib.BytesToString(msg.Signature.PublicKey)
++		if _, ok := seen[signer]; ok {
++			continue
++		}
++		validator, err := b.ValidatorSet.GetValidator(msg.Signature.PublicKey)
++		if err != nil {
++			continue
++		}
++		seen[signer] = struct{}{}
++		power += validator.VotingPower
++		if power > b.ValidatorSet.TotalPower/3 {
++			return msg.Qc.Header.Round, true
++		}
++	}
++	return 0, false
++}
++
++// GossipTimeoutQuorum() relays the validated signed votes in an exact-round timeout certificate so lagging replicas can verify the same quorum.
++func (b *BFT) GossipTimeoutQuorum(round uint64) {
++	for _, msg := range b.PacemakerMessages {
++		if msg.Qc.Header.Round == round {
++			b.GossipConsensus(msg, nil)
++		}
++	}
++}
++
+ // PhaseHas23Maj() returns true if the node received enough messages to optimistically move forward
+ func (b *BFT) PhaseHas23Maj() bool {
++	deterministic := b.usesDeterministicProposers()
+ 	switch b.Phase {
+-	case ElectionVote, ProposeVote, PrecommitVote, CommitProcess:
++	case RoundInterrupt:
++		if !deterministic {
++			return false
++		}
++		round, ok := b.TimeoutQuorumRound()
++		return ok && round >= b.Round
++	case ElectionVote:
++		return !deterministic && b.GetProposal() != nil
++	case ProposeVote, PrecommitVote, CommitProcess:
+ 		return b.GetProposal() != nil
+ 	case Propose, Precommit, Commit:
++		if deterministic && b.Phase == Propose && b.Round == 0 && !b.roundZeroNewView && b.SelfIsProposer() && b.getProposalAtPhase(b.Round, Propose) == nil {
++			return true
++		}
+ 		_, _, err := b.GetMajorityVote()
+-		return err == nil
++		if err == nil {
++			return true
++		}
++		// Let a replica cross a no-op leader phase immediately when it has already received the leader's message.
++		return deterministic && b.getProposalAtPhase(b.Round, b.Phase) != nil
+ 	}
+ 	return false
+ }
+@@ -703,29 +975,118 @@ func (b *BFT) NewRound(newHeight bool) {
+ 	b.VDFCache = []*Message{}
+ }
+ 
++// SetHeightAnchor() records the last finalized block's authenticated timestamp as the common anchor for new-height round deadlines.
++func (b *BFT) SetHeightAnchor(anchor time.Time) {
++	if anchor.IsZero() {
++		anchor = time.Now()
++	}
++	b.BFTStartTime = anchor
++	b.roundScheduleStart = 0
++	b.timeoutScheduleStart = 0
++}
++
++// RoundDeadline() returns the round's absolute end using 1, 3, 5, ... target intervals from the finalized timestamp or coordinated recovery time.
++func (b *BFT) RoundDeadline(round uint64) time.Time {
++	if round < b.roundScheduleStart {
++		return b.BFTStartTime
++	}
++	units := roundScheduleUnits(b.timeoutScheduleStart, round-b.roundScheduleStart)
++	return b.BFTStartTime.Add(time.Duration(units) * b.Config.ConsensusConfig.RoundRobinBlockInterval())
++}
++
++// roundScheduleUnits() returns cumulative 1, 3, 5, ... target intervals from the starting backoff level through step without overflowing.
++func roundScheduleUnits(start, step uint64) uint64 {
++	const maxIndex uint64 = 100_000
++	if start >= maxIndex {
++		start = maxIndex - 1
++	}
++	end := maxIndex
++	if step < maxIndex-start-1 {
++		end = start + step + 1
++	}
++	return end*end - start*start
++}
++
++// StartRound() enters the locally derived proposer's phase directly, sending a new-view vote first for later rounds and lock-preserving committee resets.
++func (b *BFT) StartRound() {
++	if !b.usesDeterministicProposers() {
++		b.Phase = Election
++		b.phase.Store(int32(b.Phase))
++		b.SetWaitTimers(b.WaitTime(Election, b.Round))
++		return
++	}
++	b.ProposerKey = SelectProposerWeightedRoundRobin(b.View, b.ValidatorSet.ValidatorSet, b.ValidatorSet.TotalPower)
++	b.Phase = Propose
++	b.phase.Store(int32(b.Phase))
++	b.roundDeadline = b.RoundDeadline(b.Round)
++	b.SetWaitTimers(time.Until(b.roundDeadline))
++	if len(b.ProposerKey) == 0 {
++		b.log.Error("unable to select deterministic proposer")
++		return
++	}
++	if b.Round != 0 || b.roundZeroNewView {
++		b.SendNewView()
++	} else if b.SelfIsProposer() {
++		b.SignalPhaseAdvance()
++	}
++}
++
++// EnterRound() joins an exact round selected by a timeout certificate or authenticated higher-round catch-up evidence.
++func (b *BFT) EnterRound(round uint64) {
++	if round <= b.Round {
++		return
++	}
++	b.Round = round - 1
++	b.NewRound(false)
++	b.StartRound()
++}
++
++// SendNewView() forwards locks and evidence to the deterministic proposer using the ElectionVote enum retained for wire compatibility.
++func (b *BFT) SendNewView() {
++	header := b.View.Copy()
++	header.Phase = ElectionVote
++	b.SendToProposer(&Message{
++		Qc: &QC{
++			Header:      header,
++			ProposerKey: b.ProposerKey,
++		},
++		HighQc:                 b.HighQC,
++		LastDoubleSignEvidence: b.ByzantineEvidence.DSE.Evidence,
++		RcBuildHeight:          b.RCBuildHeight,
++	})
++}
++
+ // RefreshRootChainInfo() updates the cached root chain info with the latest known
+ func (b *BFT) RefreshRootChainInfo() {
+-	var err lib.ErrorI
+-	// update heights
++	// Target-chain height is independent of the root-chain committee snapshot.
+ 	b.Height = b.Controller.ChainHeight()
+-	b.RootHeight = b.Controller.RootChainHeight()
+-	// update the validator set
+-	b.ValidatorSet, err = b.Controller.LoadCommittee(b.LoadRootChainId(b.Height), b.RootHeight)
++	rootHeight := b.Controller.RootChainHeight()
++	// Load the full root-chain snapshot before publishing it so a transient RPC failure cannot erase or mislabel the last authenticated snapshot.
++	validatorSet, err := b.Controller.LoadCommittee(b.LoadRootChainId(b.Height), rootHeight)
+ 	if err != nil {
+ 		b.log.Errorf("LoadCommittee() failed with err: %s", err.Error())
++		return
+ 	}
+-	// update the committee data
+-	b.CommitteeData, err = b.Controller.LoadCommitteeData()
++	committeeData, err := b.Controller.LoadCommitteeData()
+ 	if err != nil {
+ 		b.log.Errorf("LoadCommitteeData() failed with err: %s", err.Error())
++		return
+ 	}
++	b.RootHeight = rootHeight
++	b.ValidatorSet = validatorSet
++	b.CommitteeData = committeeData
+ }
+ 
+ // NewHeight() initializes / resets consensus variables preparing for the NewHeight
+ func (b *BFT) NewHeight(keepLocks ...bool) {
++	keepLock := len(keepLocks) != 0 && keepLocks[0]
+ 	// A force-round recovery is scoped to the height on which it was requested.
+ 	b.forcedRound = 0
+ 	b.forcedTimeoutRound = nil
++	lib.StopTimer(b.forceRoundTimer)
++	b.roundScheduleStart = 0
++	b.timeoutScheduleStart = 0
++	b.roundZeroNewView = keepLock
+ 	// reset VotesForHeight
+ 	b.Votes = make(VotesForHeight)
+ 	// reset ProposalsForHeight
+@@ -734,13 +1095,16 @@ func (b *BFT) NewHeight(keepLocks ...bool) {
+ 	b.PacemakerMessages = make(PacemakerMessages)
+ 	// initialize Round 0
+ 	b.NewRound(true)
+-	// set phase to Election
++	// Deterministic mode enters PROPOSE directly while legacy mode retains the VRF election protocol.
+ 	b.Phase = Election
++	if b.usesDeterministicProposers() {
++		b.Phase = Propose
++	}
+ 	b.phase.Store(int32(b.Phase))
+ 	// if resetting due to new Canopy Block and Validator Set then KeepLocks
+ 	// - protecting any who may have committed against attacks like malicious proposers from withholding
+ 	// COMMIT_MSG and sending it after the next block is produces
+-	if keepLocks == nil || !keepLocks[0] {
++	if !keepLock {
+ 		// fully reset the proposals
+ 		b.Proposals = make(ProposalsForHeight)
+ 		// reset PartialQCs
+@@ -778,17 +1142,34 @@ func (b *BFT) SafeNode(msg *Message) lib.ErrorI {
+ 
+ // SetTimerForNextPhase() calculates the wait time for a specific phase/Round, resets the Phase wait timer
+ func (b *BFT) SetTimerForNextPhase(processTime time.Duration) {
+-	waitTime := b.WaitTime(b.Phase, b.Round)
++	if !b.usesDeterministicProposers() {
++		waitTime := b.WaitTime(b.Phase, b.Round)
++		switch b.Phase {
++		default:
++			b.Phase++
++		case CommitProcess:
++			return
++		case Pacemaker:
++			b.Phase = Election
++		}
++		b.phase.Store(int32(b.Phase))
++		b.SetWaitTimers(waitTime, processTime)
++		return
++	}
+ 	switch b.Phase {
+ 	default:
+ 		b.Phase++
+ 	case CommitProcess:
+ 		return // don't set a timer
++	case RoundInterrupt:
++		return
+ 	case Pacemaker:
+-		b.Phase = Election
++		// Retain compatibility for administrative forced rounds; normal round changes enter StartRound directly from a timeout quorum.
++		b.Phase = Propose
+ 	}
+ 	b.phase.Store(int32(b.Phase))
+-	b.SetWaitTimers(waitTime, processTime)
++	// Successful messages advance phases optimistically, but every phase in a round shares one absolute failure deadline.
++	b.SetWaitTimers(time.Until(b.roundDeadline))
+ }
+ 
+ // WaitTime() returns the wait time (wait and receive consensus messages) for a specific Phase.Round
+@@ -815,7 +1196,7 @@ func (b *BFT) WaitTime(phase Phase, round uint64) (waitTime time.Duration) {
+ 		// arbitrarily sleep for 1 minute -- the BFT should be reset by an inbound block
+ 		waitTime = b.waitTime(60000, round)
+ 	case RoundInterrupt:
+-		// don't pass again through 'wait time' as it's already calculated at the msLeftInRound()
++		// Give replicas a configured window to exchange pacemaker votes before entering the next round.
+ 		waitTime = time.Duration(b.Config.RoundInterruptTimeoutMS) * time.Millisecond
+ 	case Pacemaker:
+ 		waitTime = 0
+@@ -828,53 +1209,19 @@ func (b *BFT) waitTime(sleepTimeMS int, round uint64) time.Duration {
+ 	return time.Duration(uint64(sleepTimeMS)*(2*round+1)) * time.Millisecond
+ }
+ 
+-// msLeftInRound() calculates the milliseconds left in the round
+ func (b *BFT) msLeftInRound() int {
+-	// calculate the ms for each phase
+-	electionMs := b.WaitTime(Election, b.Round).Milliseconds()
+-	electionVoteMs := b.WaitTime(ElectionVote, b.Round).Milliseconds()
+-	proposeMs := b.WaitTime(Propose, b.Round).Milliseconds()
+-	proposeVoteMs := b.WaitTime(ProposeVote, b.Round).Milliseconds()
+-	precommitMs := b.WaitTime(Precommit, b.Round).Milliseconds()
+-	precommitVoteMs := b.WaitTime(PrecommitVote, b.Round).Milliseconds()
+-	commitMs := b.WaitTime(Commit, b.Round).Milliseconds()
+-	// ms left in round = RoundWaitTime - TimeSpentInRound
+-	switch b.Phase {
+-	case Election:
+-		return int(electionMs + electionVoteMs + proposeMs + proposeVoteMs + precommitMs + precommitVoteMs + commitMs)
+-	case ElectionVote:
+-		return int(electionVoteMs + proposeMs + proposeVoteMs + precommitMs + precommitVoteMs + commitMs)
+-	case Propose:
+-		return int(proposeMs + proposeVoteMs + precommitMs + precommitVoteMs + commitMs)
+-	case ProposeVote:
+-		return int(proposeVoteMs + precommitMs + precommitVoteMs + commitMs)
+-	case Precommit:
+-		return int(precommitMs + precommitVoteMs + commitMs)
+-	case PrecommitVote:
+-		return int(precommitVoteMs + commitMs)
+-	case Commit:
+-		return int(commitMs)
+-	default:
+-		return 0
++	remaining := int64(0)
++	for phase := b.Phase; phase <= Commit; phase++ {
++		remaining += b.WaitTime(phase, b.Round).Milliseconds()
+ 	}
++	return int(remaining)
+ }
+ 
+-// SetWaitTimers() sets the phase wait timer
+-// - Phase Timeout ensures the node waits for a configured duration (Round x phaseTimeout) to allow for full voter participation
+-// This design balances synchronization speed during adverse conditions with maximizing voter participation under normal conditions
+-func (b *BFT) SetWaitTimers(phaseWaitTime, processTime time.Duration) {
+-	b.log.Debugf("Process time: %.2fs, Wait time: %.2fs", processTime.Seconds(), phaseWaitTime.Seconds())
+-	subtract := func(wt, pt time.Duration) (t time.Duration) {
+-		if pt > 24*time.Hour {
+-			return wt
+-		}
+-		if wt <= pt {
+-			return 0
+-		}
+-		return wt - pt
++// SetWaitTimers resets the shared consensus timer
++func (b *BFT) SetWaitTimers(phaseWaitTime time.Duration, processTimes ...time.Duration) {
++	if len(processTimes) != 0 && processTimes[0] > 0 && processTimes[0] < phaseWaitTime {
++		phaseWaitTime -= processTimes[0]
+ 	}
+-	// calculate the phase timer by subtracting the process time
+-	phaseWaitTime = subtract(phaseWaitTime, processTime)
+ 	b.log.Debugf("Setting consensus timer: %.2f sec", phaseWaitTime.Seconds())
+ 	// set Phase timers to go off in their respective timeouts
+ 	lib.ResetTimer(b.PhaseTimer, phaseWaitTime)
+diff --git a/bft/bft_test.go b/bft/bft_test.go
+index 6139d517..92291993 100644
+--- a/bft/bft_test.go
++++ b/bft/bft_test.go
+@@ -2,11 +2,13 @@ package bft
+ 
+ import (
+ 	"bytes"
++	"fmt"
++	"testing"
++	"time"
++
+ 	"github.com/canopy-network/canopy/lib"
+ 	"github.com/canopy-network/canopy/lib/crypto"
+ 	"github.com/stretchr/testify/require"
+-	"testing"
+-	"time"
+ )
+ 
+ const (
+@@ -15,130 +17,306 @@ const (
+ 
+ func TestStartElectionPhase(t *testing.T) {
+ 	tests := []struct {
+-		name            string
+-		detail          string
+-		selfIsValidator bool
+-		numValidators   int
+-		isCandidate     bool
++		name          string
++		numValidators int
+ 	}{
+ 		{
+-			name:            "self is leader",
+-			detail:          `deterministic key set ensures 'self' is an election candidate with a set of 6 Validators`,
+-			selfIsValidator: true,
+-			numValidators:   6,
+-			isCandidate:     true,
+-		},
+-		{
+-			name:            "self is not leader",
+-			detail:          `deterministic key set ensures 'self' is an not election candidate with a set of 5 Validators`,
+-			selfIsValidator: true,
+-			numValidators:   5,
+-			isCandidate:     false,
++			name:          "two validators",
++			numValidators: 2,
+ 		},
+ 		{
+-			name:            "self is not a validator",
+-			detail:          `self is not a validator within the deterministic key`,
+-			selfIsValidator: false,
+-			numValidators:   3,
+-			isCandidate:     false,
++			name:          "eight validators",
++			numValidators: 8,
+ 		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			// setup
+ 			c := newTestConsensus(t, Election, test.numValidators)
+-			// use validator 0 as the test replica
+-			pub, private := c.valKeys[0].PublicKey(), c.valKeys[0]
+-			if !test.selfIsValidator {
+-				pk, err := crypto.NewBLS12381PrivateKey()
+-				require.NoError(t, err)
+-				c.bft.PublicKey = pk.PublicKey().Bytes()
+-			}
+-			// deterministic key set ensures 'self' is not an election candidate with a set of 4 Validators
+-			go c.bft.StartElectionPhase()
+-			if !test.isCandidate {
+-				// if not supposed to be a 'candidate', ensure no ELECTION message sent
+-				select {
+-				case <-c.cont.sendToReplicasChan:
+-					t.Fatal("unexpected message")
+-				case <-time.After(100 * time.Millisecond):
+-					return
+-				}
+-			} else {
+-				// if supposed to be a 'candidate', validate the ELECTION message
+-				expectedView := lib.View{
+-					Height:     1,
+-					Round:      0,
+-					Phase:      Election,
+-					RootHeight: 1,
+-					NetworkId:  1,
+-					ChainId:    lib.CanopyChainId,
+-				}
+-				select {
+-				case <-time.After(testTimeout):
+-					t.Fatal("timeout")
+-				case m := <-c.cont.sendToReplicasChan:
+-					msg, ok := m.(*Message)
+-					require.True(t, ok)
+-					require.Equal(t, expectedView, *msg.Header)
+-					require.Equal(t, pub.Bytes(), msg.Vrf.PublicKey)
+-					require.Equal(t, private.Sign(lib.FormatInputIntoSeed(c.cont.proposers.Addresses, expectedView.RootHeight, expectedView.Height, expectedView.Round)), msg.Vrf.Signature)
+-				}
++			expected := SelectProposerWeightedRoundRobin(c.bft.View, c.valSet.ValidatorSet, c.valSet.TotalPower)
++
++			c.bft.StartElectionPhase()
++
++			require.Equal(t, expected, c.bft.ProposerKey)
++			select {
++			case <-c.cont.sendToReplicasChan:
++				t.Fatal("deterministic election must not broadcast candidates")
++			default:
+ 			}
+ 		})
+ 	}
+ }
+ 
+-func TestValidProcessTimeRejectsFutureTimestamp(t *testing.T) {
+-	require.Zero(t, validProcessTime(time.Now().Add(time.Hour), time.Second))
+-	require.Zero(t, validProcessTime(time.Now().Add(-time.Hour), time.Second))
+-	require.Positive(t, validProcessTime(time.Now().Add(-time.Millisecond), time.Second))
++// TestLegacyVRFProposerModePreservesElection() verifies that legacy VRF mode retains the election phase.
++func TestLegacyVRFProposerModePreservesElection(t *testing.T) {
++	c := newTestConsensus(t, Election, 6)
++	c.bft.Config.ProposerMode = lib.ProposerModeVRF
++
++	go c.bft.StartElectionPhase()
++	select {
++	case signable := <-c.cont.sendToReplicasChan:
++		message, ok := signable.(*Message)
++		require.True(t, ok)
++		require.NotNil(t, message.Vrf)
++		require.NotNil(t, c.bft.SortitionData)
++		require.Nil(t, c.bft.ProposerKey)
++	case <-time.After(testTimeout):
++		t.Fatal("legacy VRF candidate was not broadcast")
++	}
++
++	c.bft.StartRound()
++	require.Equal(t, Election, c.bft.Phase)
++	c.bft.PhaseTimer.Stop()
++}
++
++// TestRoundDeadlinesAreTimestampAnchoredAndBackOff() verifies anchored deadlines and round backoff.
++func TestRoundDeadlinesAreTimestampAnchoredAndBackOff(t *testing.T) {
++	c := newTestConsensus(t, Propose, 4)
++	c.bft.Config.RoundRobinBlockIntervalMS = 750
++	anchor := time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC)
++	c.bft.SetHeightAnchor(anchor)
++
++	require.Equal(t, anchor.Add(750*time.Millisecond), c.bft.RoundDeadline(0))
++	require.Equal(t, anchor.Add(3*time.Second), c.bft.RoundDeadline(1))
++	require.Equal(t, anchor.Add(6750*time.Millisecond), c.bft.RoundDeadline(2))
++}
++
++// TestForcedRoundDeadlineUsesRequestedTimeoutSchedule() verifies forced rounds use the requested timeout schedule.
++func TestForcedRoundDeadlineUsesRequestedTimeoutSchedule(t *testing.T) {
++	c := newTestConsensus(t, Propose, 1)
++	c.bft.Round = 2
++	c.bft.round.Store(2)
++	// Reproduce recovery from a stale finalized timestamp; the old implementation derived round 7 from this anchor and expired it immediately.
++	c.bft.SetHeightAnchor(time.Unix(1, 0))
++	forceAt := time.Now()
++	timeoutRound := uint64(0)
++	require.NoError(t, c.bft.ScheduleForceRound(7, forceAt, &timeoutRound))
++	select {
++	case <-c.bft.forceRoundTimer.C:
++	case <-time.After(testTimeout):
++		t.Fatal("force-round timer did not fire")
++	}
++	newViewSent := make(chan struct{})
++	go func() {
++		<-c.cont.sendToProposerChan
++		close(newViewSent)
++	}()
++	c.bft.applyForcedRound()
++	<-newViewSent
++
++	require.Equal(t, forceAt.Add(500*time.Millisecond), c.bft.roundDeadline)
++	require.Equal(t, forceAt.Add(2*time.Second), c.bft.RoundDeadline(8))
++	require.Equal(t, forceAt.Add(4500*time.Millisecond), c.bft.RoundDeadline(9))
++}
++
++// TestValidatedProposalExtendsDeadlineMonotonically() verifies validated proposals only extend deadlines.
++func TestValidatedProposalExtendsDeadlineMonotonically(t *testing.T) {
++	c := newTestConsensus(t, Propose, 4)
++	anchor := time.Now().Add(-250 * time.Millisecond).Truncate(time.Microsecond)
++	c.bft.SetHeightAnchor(anchor)
++	interval := c.bft.Config.ConsensusConfig.RoundRobinBlockInterval()
++	c.bft.roundDeadline = anchor.Add(interval)
++
++	encode := func(at time.Time) []byte {
++		bz, err := lib.Marshal(&lib.Block{BlockHeader: &lib.BlockHeader{Time: uint64(at.UnixMicro())}})
++		require.NoError(t, err)
++		return bz
++	}
++
++	c.bft.extendRoundDeadlineFromProposal(encode(anchor.Add(2 * interval)))
++	require.Equal(t, anchor.Add(2*interval), c.bft.roundDeadline)
++
++	c.bft.extendRoundDeadlineFromProposal(encode(anchor.Add(interval)))
++	require.Equal(t, anchor.Add(2*interval), c.bft.roundDeadline,
++		"an older proposal timestamp must not shorten the deadline")
++}
++
++// TestProposerAdoptsProducedBlockDeadlineBeforeBroadcast() verifies proposers adopt the produced block deadline before broadcasting.
++func TestProposerAdoptsProducedBlockDeadlineBeforeBroadcast(t *testing.T) {
++	c := newTestConsensus(t, Propose, 1)
++	c.bft.ProposerKey = c.bft.PublicKey
++	c.bft.roundDeadline = time.Now().Add(-time.Second)
++	proposalTime := time.Now().Add(500 * time.Millisecond).Truncate(time.Microsecond)
++	c.cont.proposalTime = uint64(proposalTime.UnixMicro())
++	// Model the original round deadline already being selectable while proposal construction holds the controller lock.
++	lib.ResetTimer(c.bft.PhaseTimer, 0)
++	time.Sleep(time.Millisecond)
++
++	go c.bft.StartProposePhase()
++	select {
++	case <-c.cont.sendToReplicasChan:
++	case <-time.After(testTimeout):
++		t.Fatal("proposal was not broadcast")
++	}
++
++	require.Equal(t, proposalTime, c.bft.roundDeadline)
++	select {
++	case <-c.bft.PhaseTimer.C:
++		t.Fatal("expired round timer remained armed after proposal production")
++	default:
++	}
++	c.bft.PhaseTimer.Stop()
++}
++
++// TestCommitteeResetCollectsRoundZeroNewViews() verifies committee resets collect round-zero new-view votes.
++func TestCommitteeResetCollectsRoundZeroNewViews(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	c.cont.rootHeight = 1
++	locked := c.setupTestableHighQC(t, false, true)
++	c.bft.HighQC = locked
++	c.bft.NewHeight(true)
++	c.bft.SetHeightAnchor(time.Now())
++
++	go c.bft.StartRound()
++	select {
++	case signable := <-c.cont.sendToProposerChan:
++		msg := signable.(*Message)
++		require.Equal(t, ElectionVote, msg.Qc.Header.Phase)
++		require.Same(t, locked, msg.HighQc)
++	case <-time.After(testTimeout):
++		t.Fatal("committee reset did not send a round-zero new-view vote")
++	}
++
++	c.bft.ProposerKey = c.bft.PublicKey
++	c.bft.StartProposePhase()
++	select {
++	case <-c.cont.sendToReplicasChan:
++		t.Fatal("committee-reset proposer used the one-signer round-zero shortcut")
++	default:
++	}
++
++	c.simElectionVotePhase(t, 0, false, false, false, 0)
++	go c.bft.StartProposePhase()
++	select {
++	case signable := <-c.cont.sendToReplicasChan:
++		msg := signable.(*Message)
++		require.Same(t, locked, msg.HighQc)
++		signers, _, err := msg.Qc.Signature.GetSigners(c.bft.ValidatorSet)
++		require.NoError(t, err)
++		require.Len(t, signers, 2)
++	case <-time.After(testTimeout):
++		t.Fatal("committee-reset proposer did not propose after new-view quorum")
++	}
++	c.bft.PhaseTimer.Stop()
++}
++
++// TestCommitteeResetDoesNotAcceptRoundZeroOneSignerProof() verifies committee resets reject a round-zero single-signer proof.
++func TestCommitteeResetDoesNotAcceptRoundZeroOneSignerProof(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	c.bft.ProposerKey = c.bft.PublicKey
++	vote, signature, err := c.bft.roundZeroProposerProof()
++	require.NoError(t, err)
++	block, blockHash, results, resultsHash := c.proposal(t)
++	msg := &Message{
++		Header: c.view(Propose),
++		Qc: &QC{
++			Header:      vote.Qc.Header,
++			Block:       block,
++			BlockHash:   blockHash,
++			Results:     results,
++			ResultsHash: resultsHash,
++			ProposerKey: c.bft.PublicKey,
++			Signature:   signature,
++		},
++	}
++	require.NoError(t, msg.Sign(c.bft.PrivateKey))
++	c.bft.roundZeroNewView = true
++	params, errI := c.bft.GetValidateMessageParams(msg)
++	require.NoError(t, errI)
++	partial, errI := c.bft.CheckProposerMessage(msg, params)
++	require.NoError(t, errI)
++	require.True(t, partial)
++
++	c.bft.roundZeroNewView = false
++	params, errI = c.bft.GetValidateMessageParams(msg)
++	require.NoError(t, errI)
++	partial, errI = c.bft.CheckProposerMessage(msg, params)
++	require.NoError(t, errI)
++	require.False(t, partial)
++}
++
++// TestTimeoutQuorumRequiresTwoThirdsInOneExactRound() verifies timeout quorums cannot combine votes from different rounds.
++func TestTimeoutQuorumRequiresTwoThirdsInOneExactRound(t *testing.T) {
++	c := newTestConsensus(t, Propose, 4)
++	add := func(validator, round int) {
++		msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, uint64(round))}}
++		require.NoError(t, msg.Sign(c.valKeys[validator]))
++		key := fmt.Sprintf("%d/%s", round, lib.BytesToString(msg.Signature.PublicKey))
++		c.bft.PacemakerMessages[key] = msg
++	}
++
++	add(0, 0)
++	add(1, 0)
++	add(2, 1)
++	add(3, 1)
++	_, ok := c.bft.TimeoutQuorumRound()
++	require.False(t, ok, "votes from different rounds must not be combined")
++
++	add(2, 0)
++	round, ok := c.bft.TimeoutQuorumRound()
++	require.True(t, ok)
++	require.Equal(t, uint64(0), round)
++}
++
++// TestTimeoutCatchUpRequiresDistinctOneThirdPower() verifies catch-up evidence requires distinct one-third voting power.
++func TestTimeoutCatchUpRequiresDistinctOneThirdPower(t *testing.T) {
++	c := newTestConsensus(t, RoundInterrupt, 4)
++	add := func(validator int, round uint64) {
++		msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, round)}}
++		require.NoError(t, msg.Sign(c.valKeys[validator]))
++		key := fmt.Sprintf("%d/%s", round, lib.BytesToString(msg.Signature.PublicKey))
++		c.bft.PacemakerMessages[key] = msg
++	}
++
++	add(0, 3)
++	add(0, 4)
++	_, ok := c.bft.TimeoutCatchUpRound()
++	require.False(t, ok, "one validator must not be counted once per round")
++
++	add(1, 3)
++	round, ok := c.bft.TimeoutCatchUpRound()
++	require.True(t, ok)
++	require.Equal(t, uint64(3), round)
++}
++
++// TestTimeoutCatchUpHealsAdjacentRoundSplit() verifies catch-up evidence heals validators split across adjacent rounds.
++func TestTimeoutCatchUpHealsAdjacentRoundSplit(t *testing.T) {
++	c := newTestConsensus(t, RoundInterrupt, 2)
++	msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, 1)}}
++	require.NoError(t, msg.Sign(c.valKeys[1]))
++	key := fmt.Sprintf("1/%s", lib.BytesToString(msg.Signature.PublicKey))
++	c.bft.PacemakerMessages[key] = msg
++
++	round, ok := c.bft.TimeoutCatchUpRound()
++	require.True(t, ok)
++	require.Equal(t, uint64(1), round,
++		"a round-zero validator must be able to join the round-one validator")
+ }
+ 
+ func TestStartElectionVotePhase(t *testing.T) {
+ 	tests := []struct {
+-		name                 string
+-		detail               string
+-		numValidators        int
+-		isElectionCandidate  bool
+-		noElectionCandidates bool
+-		hasBE                bool
++		name          string
++		numValidators int
++		hasBE         bool
+ 	}{
+ 		{
+-			name:                "self is election candidate",
+-			detail:              `deterministic key set ensures 'self' is an election candidate with a set of 2 Validators`,
+-			numValidators:       3,
+-			isElectionCandidate: true,
+-		},
+-		{
+-			name:                "self is not an election candidate",
+-			detail:              `deterministic key set ensures 'self' is not an election candidate with a set of 5 Validators`,
+-			numValidators:       5,
+-			isElectionCandidate: false,
++			name:          "three validators",
++			numValidators: 3,
+ 		},
+ 		{
+-			name:                 "pseudorandom",
+-			detail:               `didn't 'handle messages' from any candidate, fallback to pseudorandom`,
+-			numValidators:        8,
+-			noElectionCandidates: true,
++			name:          "eight validators",
++			numValidators: 8,
+ 		},
+ 		{
+ 			name:          "byzantine evidence not nil",
+-			detail:        `testing sending the byzantine evidence to the leader with the leader vote`,
+ 			numValidators: 5,
+ 			hasBE:         true,
+ 		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			// setup
+ 			c := newTestConsensus(t, ElectionVote, test.numValidators)
+-			switch {
+-			case test.noElectionCandidates:
+-				c.setSortitionData(t)
+-			default:
+-				c.simElectionPhase(t)
+-			}
++			expectedProposer := SelectProposerWeightedRoundRobin(c.bft.View, c.valSet.ValidatorSet, c.valSet.TotalPower)
++			c.bft.ProposerKey = expectedProposer
+ 			expectedDoubleSignEvidence := DoubleSignEvidences{}
+ 			if test.hasBE {
+ 				expectedDoubleSignEvidence.Evidence = c.newTestDoubleSignEvidence(t)
+@@ -146,7 +324,7 @@ func TestStartElectionVotePhase(t *testing.T) {
+ 					DSE: expectedDoubleSignEvidence,
+ 				}
+ 			}
+-			pub, _, expectedView := c.valKeys[0].PublicKey(), c.valKeys[0], lib.View{
++			expectedView := lib.View{
+ 				NetworkId:  lib.CanopyMainnetNetworkId,
+ 				ChainId:    lib.CanopyChainId,
+ 				Height:     1,
+@@ -163,11 +341,7 @@ func TestStartElectionVotePhase(t *testing.T) {
+ 				require.True(t, ok)
+ 				require.NotNil(t, msg.Qc)
+ 				require.Equal(t, *msg.Qc.Header, expectedView)
+-				if test.isElectionCandidate || test.noElectionCandidates {
+-					require.Equal(t, msg.Qc.ProposerKey, pub.Bytes())
+-				} else {
+-					require.Equal(t, msg.Qc.ProposerKey, c.valKeys[3].PublicKey().Bytes())
+-				}
++				require.Equal(t, expectedProposer, msg.Qc.ProposerKey)
+ 				if test.hasBE {
+ 					require.NotNil(t, msg.LastDoubleSignEvidence)
+ 					require.Equal(t, expectedDoubleSignEvidence.Evidence, msg.LastDoubleSignEvidence)
+@@ -187,8 +361,8 @@ func TestStartProposePhase(t *testing.T) {
+ 		hasSafetyHQC   bool
+ 	}{
+ 		{
+-			name:   "self is not proposer",
+-			detail: `no election vote quorum certificate received`,
++			name:   "round zero deterministic proposer",
++			detail: `no network new-view quorum certificate required`,
+ 		},
+ 		{
+ 			name:        "self is proposer",
+@@ -218,6 +392,7 @@ func TestStartProposePhase(t *testing.T) {
+ 		t.Run(test.name, func(t *testing.T) {
+ 			// setup
+ 			c := newTestConsensus(t, Propose, 3)
++			c.bft.ProposerKey = c.bft.PublicKey
+ 			var multiKey crypto.MultiPublicKeyI
+ 			if test.receiveEVQC {
+ 				multiKey = c.simElectionVotePhase(t, 0, test.hasBE, test.hasLivenessHQC, test.hasSafetyHQC, 0)
+@@ -240,13 +415,8 @@ func TestStartProposePhase(t *testing.T) {
+ 			go c.bft.StartProposePhase()
+ 			select {
+ 			case <-time.After(testTimeout):
+-				if test.receiveEVQC {
+-					t.Fatal("timeout")
+-				}
++				t.Fatal("timeout")
+ 			case m := <-c.cont.sendToReplicasChan:
+-				if !test.receiveEVQC {
+-					t.Fatal("unexpected message")
+-				}
+ 				msg, ok := m.(*Message)
+ 				require.True(t, ok)
+ 				require.Equal(t, expectedView, *msg.Header)
+@@ -256,9 +426,15 @@ func TestStartProposePhase(t *testing.T) {
+ 				require.NoError(t, e)
+ 				require.Equal(t, block, msg.Qc.Block)
+ 				require.Equal(t, results.Hash(), msg.Qc.Results.Hash())
+-				expectedAggSig, err := multiKey.AggregateSignatures()
+-				require.NoError(t, err)
+-				require.Equal(t, expectedAggSig, msg.Qc.Signature.Signature)
++				if test.receiveEVQC {
++					expectedAggSig, err := multiKey.AggregateSignatures()
++					require.NoError(t, err)
++					require.Equal(t, expectedAggSig, msg.Qc.Signature.Signature)
++				} else {
++					signers, _, err := msg.Qc.Signature.GetSigners(c.bft.ValidatorSet)
++					require.NoError(t, err)
++					require.Equal(t, [][]byte{c.bft.PublicKey}, signers)
++				}
+ 				if test.hasBE {
+ 					expectedDSE := c.newTestDoubleSignEvidence(t)
+ 					require.EqualExportedValues(t, expectedDSE[0].VoteA, msg.LastDoubleSignEvidence[0].VoteA)
+@@ -688,6 +864,8 @@ func TestStartCommitProcessPhase(t *testing.T) {
+ func TestRoundInterrupt(t *testing.T) {
+ 	// setup
+ 	c := newTestConsensus(t, Propose, 3)
++	c.bft.Config.RoundInterruptTimeoutMS = 123
++	c.bft.Round = 2
+ 	go c.bft.RoundInterrupt()
+ 	select {
+ 	case <-time.After(testTimeout):
+@@ -698,12 +876,15 @@ func TestRoundInterrupt(t *testing.T) {
+ 		require.EqualExportedValues(t, msg.Qc.Header, &lib.View{
+ 			NetworkId:  lib.CanopyMainnetNetworkId,
+ 			Height:     1,
+-			Round:      0,
++			Round:      2,
+ 			RootHeight: 1,
+ 			ChainId:    lib.CanopyChainId,
+ 			Phase:      RoundInterrupt,
+ 		})
+ 		require.Equal(t, c.bft.Phase, RoundInterrupt)
++		require.Equal(t, 123, c.bft.Config.RoundInterruptTimeoutMS,
++			"round interrupt must not overwrite the configured pacemaker window")
++		require.Equal(t, 123*time.Millisecond, c.bft.WaitTime(RoundInterrupt, c.bft.Round))
+ 	}
+ }
+ 
+@@ -742,6 +923,7 @@ func TestPacemaker(t *testing.T) {
+ 				numValidators = 2
+ 			}
+ 			c := newTestConsensus(t, Propose, numValidators)
++			c.bft.Config.ProposerMode = lib.ProposerModeVRF
+ 			if test.hasPeerPacemakerVotes {
+ 				c.simPacemakerPhase(t)
+ 			}
+@@ -753,6 +935,7 @@ func TestPacemaker(t *testing.T) {
+ 
+ func TestPacemakerRequiresMoreThanOneThird(t *testing.T) {
+ 	c := newTestConsensus(t, Propose, 2)
++	c.bft.Config.ProposerMode = lib.ProposerModeVRF
+ 	c.bft.ValidatorSet.ValidatorSet.ValidatorSet[0].VotingPower = 67
+ 	c.bft.ValidatorSet.ValidatorSet.ValidatorSet[1].VotingPower = 33
+ 	c.bft.ValidatorSet.TotalPower = 100
+@@ -765,7 +948,7 @@ func TestPacemakerRequiresMoreThanOneThird(t *testing.T) {
+ }
+ 
+ func TestScheduleForceRound(t *testing.T) {
+-	c := newTestConsensus(t, Election, 1)
++	c := newTestConsensus(t, Propose, 1)
+ 	c.bft.Round = 2
+ 	c.bft.round.Store(2)
+ 	lockedQC := &QC{}
+@@ -773,15 +956,25 @@ func TestScheduleForceRound(t *testing.T) {
+ 
+ 	timeoutRound := uint64(0)
+ 	require.NoError(t, c.bft.ScheduleForceRound(7, time.Now().Add(time.Hour), &timeoutRound))
+-	c.bft.Phase = Pacemaker
+-	c.bft.HandlePhase()
+-	require.Equal(t, Pacemaker, c.bft.Phase)
++	c.bft.applyForcedRound()
++	require.Equal(t, Propose, c.bft.Phase)
+ 	require.Equal(t, uint64(2), c.bft.Round)
+ 
+ 	require.NoError(t, c.bft.ScheduleForceRound(7, time.Now(), &timeoutRound))
+-	c.bft.HandlePhase()
++	select {
++	case <-c.bft.forceRoundTimer.C:
++	case <-time.After(testTimeout):
++		t.Fatal("force-round timer did not fire")
++	}
++	newViewSent := make(chan struct{})
++	go func() {
++		<-c.cont.sendToProposerChan
++		close(newViewSent)
++	}()
++	c.bft.applyForcedRound()
++	<-newViewSent
+ 	require.Equal(t, uint64(7), c.bft.CurrentRound())
+-	require.Equal(t, Election, c.bft.Phase)
++	require.Equal(t, Propose, c.bft.Phase)
+ 	require.Same(t, lockedQC, c.bft.HighQC)
+ 	require.Equal(t, time.Duration(c.bft.Config.ElectionTimeoutMS)*time.Millisecond, c.bft.WaitTime(Election, c.bft.Round+1))
+ 	require.Error(t, c.bft.ScheduleForceRound(7, time.Now(), nil))
+@@ -790,6 +983,40 @@ func TestScheduleForceRound(t *testing.T) {
+ 	c.bft.PhaseTimer.Stop()
+ }
+ 
++// TestRefreshRootChainInfoPublishesCommitteeSnapshotAtomically() verifies root-chain committee snapshots are published atomically.
++func TestRefreshRootChainInfoPublishesCommitteeSnapshotAtomically(t *testing.T) {
++	c := newTestConsensus(t, Propose, 1)
++	oldValidators := c.bft.ValidatorSet.ValidatorSet
++	oldCommitteeData := &lib.CommitteeData{LastRootHeightUpdated: 7}
++	c.bft.RootHeight = 7
++	c.bft.CommitteeData = oldCommitteeData
++
++	newValidators, _, _ := newTestValSet(t, 2)
++	newCommitteeData := &lib.CommitteeData{LastRootHeightUpdated: 8}
++	c.cont.rootHeight = 8
++	c.cont.valSet[lib.CanopyChainId] = newValidators
++	c.cont.committeeData = newCommitteeData
++
++	c.cont.loadCommitteeErr = lib.ErrNoValidators()
++	c.bft.RefreshRootChainInfo()
++	require.Equal(t, uint64(7), c.bft.RootHeight)
++	require.Same(t, oldValidators, c.bft.ValidatorSet.ValidatorSet)
++	require.Same(t, oldCommitteeData, c.bft.CommitteeData)
++
++	c.cont.loadCommitteeErr = nil
++	c.cont.loadCommitteeDataErr = lib.ErrNoValidators()
++	c.bft.RefreshRootChainInfo()
++	require.Equal(t, uint64(7), c.bft.RootHeight)
++	require.Same(t, oldValidators, c.bft.ValidatorSet.ValidatorSet)
++	require.Same(t, oldCommitteeData, c.bft.CommitteeData)
++
++	c.cont.loadCommitteeDataErr = nil
++	c.bft.RefreshRootChainInfo()
++	require.Equal(t, uint64(8), c.bft.RootHeight)
++	require.Same(t, newValidators.ValidatorSet, c.bft.ValidatorSet.ValidatorSet)
++	require.Same(t, newCommitteeData, c.bft.CommitteeData)
++}
++
+ func TestPhaseHas23Maj(t *testing.T) {
+ 	c := newTestConsensus(t, Propose, 3)
+ 	// 75% votes
+@@ -895,7 +1122,7 @@ func TestNewRound(t *testing.T) {
+ 			c.simPrecommitPhase(t, 0)
+ 			c.simCommitPhase(t, 0, 0)
+ 			c.simPacemakerPhase(t)
+-			eleLen, evVoteLen, propNil, propVoteLen, precNil, precVoteLen, comNil, expRound, paceLen := 4, 1, false, 1, false, 1, false, uint64(0), 3
++			eleLen, evVoteLen, propNil, propVoteLen, precNil, precVoteLen, comNil, expRound, paceLen := 0, 1, false, 1, false, 1, false, uint64(0), 3
+ 			if test.newRound || test.newHeight {
+ 				eleLen, evVoteLen, propNil, propVoteLen, precNil, precVoteLen, comNil, expRound = 0, 0, true, 0, true, 0, true, 1
+ 			}
+diff --git a/bft/election.go b/bft/election.go
+index 7669df0c..d09f9406 100644
+--- a/bft/election.go
++++ b/bft/election.go
+@@ -1,9 +1,14 @@
+ package bft
+ 
+ import (
++	"bytes"
++	"encoding/binary"
++	"math/big"
++	"math/bits"
++	"sort"
++
+ 	"github.com/canopy-network/canopy/lib"
+ 	"github.com/canopy-network/canopy/lib/crypto"
+-	"math/big"
+ )
+ 
+ /*
+@@ -111,6 +116,66 @@ func SelectProposerFromCandidates(candidates []VRFCandidate, data *lib.Sortition
+ 	return
+ }
+ 
++// SelectProposerWeightedRoundRobin() maps a deterministic chain-and-view schedule into the validator set's canonical stake intervals.
++func SelectProposerWeightedRoundRobin(view *lib.View, validators *lib.ConsensusValidators, totalPower uint64) []byte {
++	if view == nil || validators == nil || len(validators.ValidatorSet) == 0 || totalPower == 0 {
++		return nil
++	}
++	// Canonicalize validators so root-chain slice ordering cannot change the schedule or stake intervals.
++	canonicalSet := append([]*lib.ConsensusValidator(nil), validators.ValidatorSet...)
++	sort.Slice(canonicalSet, func(i, j int) bool {
++		if canonicalSet[i] == nil {
++			return canonicalSet[j] != nil
++		}
++		if canonicalSet[j] == nil {
++			return false
++		}
++		return bytes.Compare(canonicalSet[i].PublicKey, canonicalSet[j].PublicKey) < 0
++	})
++	var actualPower uint64
++	for _, validator := range canonicalSet {
++		if validator == nil || validator.VotingPower > ^uint64(0)-actualPower {
++			return nil
++		}
++		actualPower += validator.VotingPower
++	}
++	if actualPower != totalPower {
++		return nil
++	}
++	powerIndex := weightedRoundRobinPowerIndex(view, totalPower)
++	var powerCount uint64
++	for _, validator := range canonicalSet {
++		powerCount += validator.VotingPower
++		if powerCount > powerIndex {
++			return validator.PublicKey
++		}
++	}
++	return nil
++}
++
++// weightedRoundRobinPowerIndex() maps a consensus view into the validator set's total voting-power range.
++func weightedRoundRobinPowerIndex(view *lib.View, totalPower uint64) uint64 {
++	// Fixed Weyl increments keep adjacent tickets over one third of the uint64 space apart while chain identity rotates the schedule.
++	const (
++		heightStride uint64 = 0x9e3779b97f4a7c15 // golden-ratio Weyl increment
++		roundStride  uint64 = 0x6a09e667f3bcc909 // sqrt(2)-1 Weyl increment
++	)
++	seed := make([]byte, 0, len("canopy-weighted-round-robin")+2*8)
++	seed = append(seed, []byte("canopy-weighted-round-robin")...)
++	seed = binary.BigEndian.AppendUint64(seed, view.NetworkId)
++	seed = binary.BigEndian.AppendUint64(seed, view.ChainId)
++	scheduleHash := crypto.Hash(seed)
++	offset := binary.BigEndian.Uint64(scheduleHash[:8])
++	height := view.Height
++	if height != 0 {
++		height--
++	}
++	ticket := offset + height*heightStride + view.Round*roundStride
++	// Scaling instead of taking ticket modulo totalPower limits a one-unit power increase to a one-index movement.
++	powerIndex, _ := bits.Mul64(ticket, totalPower)
++	return powerIndex
++}
++
+ // VRF() 'Practical Verifiable Random Function': a function that given a secret key and a message, generates a unique random-looking number
+ // along with a certificate that anyone can check to confirm that this number was produced correctly from that specific message, without revealing the private key or
+ // how the number was made.
+diff --git a/bft/election_test.go b/bft/election_test.go
+index 870aaadc..5d4dd8de 100644
+--- a/bft/election_test.go
++++ b/bft/election_test.go
+@@ -179,6 +179,119 @@ func TestSelectProposerFromCandidates(t *testing.T) {
+ 	}
+ }
+ 
++// TestSelectProposerWeightedRoundRobin() verifies deterministic stake-weighted proposer selection.
++func TestSelectProposerWeightedRoundRobin(t *testing.T) {
++	validators := &lib.ConsensusValidators{ValidatorSet: []*lib.ConsensusValidator{
++		{PublicKey: []byte("validator-a"), VotingPower: 1},
++		{PublicKey: []byte("validator-b"), VotingPower: 2},
++		{PublicKey: []byte("validator-c"), VotingPower: 3},
++	}}
++	const totalPower = uint64(6)
++	const samples = uint64(60_000)
++	const tolerance = float64(samples) / 100
++	view := &lib.View{NetworkId: 1, ChainId: 1, Height: 1}
++
++	// The immutable 64-bit schedule converges on each validator's stake share.
++	heightCounts := make(map[string]int)
++	for height := uint64(1); height <= samples; height++ {
++		view.Height, view.Round = height, 0
++		proposer := SelectProposerWeightedRoundRobin(view, validators, totalPower)
++		heightCounts[string(proposer)]++
++	}
++	require.InDelta(t, float64(samples/6), heightCounts["validator-a"], tolerance)
++	require.InDelta(t, float64(samples/3), heightCounts["validator-b"], tolerance)
++	require.InDelta(t, float64(samples/2), heightCounts["validator-c"], tolerance)
++
++	// Recovery rounds use an independent immutable stride with the same weighting.
++	roundCounts := make(map[string]int)
++	view.Height = 10
++	for round := uint64(0); round < samples; round++ {
++		view.Round = round
++		proposer := SelectProposerWeightedRoundRobin(view, validators, totalPower)
++		roundCounts[string(proposer)]++
++	}
++	require.InDelta(t, float64(samples/6), roundCounts["validator-a"], tolerance)
++	require.InDelta(t, float64(samples/3), roundCounts["validator-b"], tolerance)
++	require.InDelta(t, float64(samples/2), roundCounts["validator-c"], tolerance)
++
++	view.Height, view.Round = 42, 3
++	first := SelectProposerWeightedRoundRobin(view, validators, totalPower)
++	second := SelectProposerWeightedRoundRobin(view, validators, totalPower)
++	require.Equal(t, first, second)
++	require.Nil(t, SelectProposerWeightedRoundRobin(view, validators, totalPower+1))
++	require.Nil(t, SelectProposerWeightedRoundRobin(nil, validators, totalPower))
++}
++
++// TestSelectProposerWeightedRoundRobinStakeEditDoesNotRekeySchedule() verifies stake edits do not re-key the proposer schedule.
++func TestSelectProposerWeightedRoundRobinStakeEditDoesNotRekeySchedule(t *testing.T) {
++	view := &lib.View{NetworkId: 1, ChainId: 1}
++	for height := uint64(1); height <= 1_000; height++ {
++		view.Height, view.Round = height, 0
++		before := weightedRoundRobinPowerIndex(view, 2_000_000_000)
++		after := weightedRoundRobinPowerIndex(view, 2_000_000_001)
++		require.GreaterOrEqual(t, after, before)
++		require.LessOrEqual(t, after-before, uint64(1))
++	}
++}
++
++// TestSelectProposerWeightedRoundRobinIgnoresValidatorInputOrder() verifies validator input order does not affect selection.
++func TestSelectProposerWeightedRoundRobinIgnoresValidatorInputOrder(t *testing.T) {
++	firstOrder := &lib.ConsensusValidators{ValidatorSet: []*lib.ConsensusValidator{
++		{PublicKey: []byte("validator-c"), VotingPower: 3, NetAddress: "tcp://one.example"},
++		{PublicKey: []byte("validator-a"), VotingPower: 1, NetAddress: "tcp://one.example"},
++		{PublicKey: []byte("validator-b"), VotingPower: 2, NetAddress: "tcp://one.example"},
++	}}
++	secondOrder := &lib.ConsensusValidators{ValidatorSet: []*lib.ConsensusValidator{
++		{PublicKey: []byte("validator-b"), VotingPower: 2, NetAddress: "tcp://two.example"},
++		{PublicKey: []byte("validator-c"), VotingPower: 3, NetAddress: "tcp://two.example"},
++		{PublicKey: []byte("validator-a"), VotingPower: 1, NetAddress: "tcp://two.example"},
++	}}
++	view := &lib.View{NetworkId: 1, ChainId: 1}
++	for height := uint64(1); height <= 12; height++ {
++		for round := uint64(0); round < 6; round++ {
++			view.Height, view.Round = height, round
++			require.Equal(t,
++				SelectProposerWeightedRoundRobin(view, firstOrder, 6),
++				SelectProposerWeightedRoundRobin(view, secondOrder, 6),
++			)
++		}
++	}
++}
++
++// TestSelectProposerWeightedRoundRobinDoesNotPinSubThirdValidator() verifies adjacent tickets do not pin a sub-third validator.
++func TestSelectProposerWeightedRoundRobinDoesNotPinSubThirdValidator(t *testing.T) {
++	validators := &lib.ConsensusValidators{ValidatorSet: []*lib.ConsensusValidator{
++		{PublicKey: []byte("validator-a"), VotingPower: 1},
++		{PublicKey: []byte("validator-b"), VotingPower: 1},
++		{PublicKey: []byte("validator-c"), VotingPower: 1},
++		{PublicKey: []byte("validator-d"), VotingPower: 1},
++	}}
++	// These chain IDs produced runs of 13,323 rounds and 3,452 heights with hash-derived odd strides; a quarter-power validator must now rotate on every adjacent ticket along either schedule dimension.
++	for _, chainID := range []uint64{6_212, 13_210} {
++		view := &lib.View{NetworkId: 1, ChainId: chainID, Height: 1}
++		var previous []byte
++		for round := uint64(0); round < 20_000; round++ {
++			view.Round = round
++			proposer := SelectProposerWeightedRoundRobin(view, validators, 4)
++			if previous != nil {
++				require.NotEqual(t, previous, proposer, "chain %d pinned proposer at round %d", chainID, round)
++			}
++			previous = proposer
++		}
++
++		view.Round = 0
++		previous = nil
++		for height := uint64(1); height <= 20_000; height++ {
++			view.Height = height
++			proposer := SelectProposerWeightedRoundRobin(view, validators, 4)
++			if previous != nil {
++				require.NotEqual(t, previous, proposer, "chain %d pinned proposer at height %d", chainID, height)
++			}
++			previous = proposer
++		}
++	}
++}
++
+ func newTestSortitionData(t *testing.T, c *testConsensus) *lib.SortitionData {
+ 	var lastNProposers [][]byte
+ 	for _, k := range c.valKeys {
+diff --git a/bft/mock_test.go b/bft/mock_test.go
+index 165be33a..2dc96fa9 100644
+--- a/bft/mock_test.go
++++ b/bft/mock_test.go
+@@ -39,6 +39,7 @@ func newTestConsensus(t *testing.T, phase Phase, numValidators int) (tc *testCon
+ 	// Disable VDF service for testing
+ 	config := lib.DefaultConfig()
+ 	config.RunVDF = false
++	config.ProposerMode = lib.ProposerModeStakeWeightedRoundRobin
+ 	// create the bft object using the mocks
+ 	tc.bft, err = New(config, tc.valKeys[0], 1, 1, tc.cont, config.RunVDF, nil, lib.NewDefaultLogger())
+ 	tc.bft.ValidatorSet = tc.valSet
+@@ -93,23 +94,10 @@ func newTestValSet(t *testing.T, numValidators int) (valSet ValSet, valKeys []cr
+ 	return
+ }
+ 
+-// simElectionPhase() simulates the election phase of the BFT lifecycle
++// simElectionPhase() simulates deterministic leader selection.
+ func (tc *testConsensus) simElectionPhase(t *testing.T) {
+-	// set the sortition data for the election
+-	tc.setSortitionData(t)
+-	// for each validator, act like a Leader Candidate
+-	// NOTE: in real execution, the Validator checks if
+-	// it's a Candidate before sending messages out
+-	for _, k := range tc.valKeys {
+-		// signs and sends a message with their VRF
+-		msg := &Message{
+-			Header: tc.view(Election),
+-			Vrf:    VRF(tc.cont.proposers.Addresses, 0, 1, 0, k),
+-		}
+-		require.NoError(t, msg.Sign(k))
+-		require.NoError(t, tc.bft.HandleMessage(msg))
+-	}
+-	return
++	tc.bft.StartElectionPhase()
++	require.NotEmpty(t, tc.bft.ProposerKey)
+ }
+ 
+ // simElectionVotePhase() simulates the ELECTION-VOTE phase of the BFT lifecycle
+@@ -501,6 +489,12 @@ type testController struct {
+ 	gossipConsensusChan chan *Message
+ 	sendToProposerChan  chan lib.Signable
+ 	sendToReplicasChan  chan lib.Signable
++
++	rootHeight           uint64
++	committeeData        *lib.CommitteeData
++	loadCommitteeErr     lib.ErrorI
++	loadCommitteeDataErr lib.ErrorI
++	proposalTime         uint64
+ }
+ 
+ func (t *testController) CommitCertificate(qc *lib.QuorumCertificate, block *lib.Block, blockResult *lib.BlockResult, ts uint64) (err lib.ErrorI) {
+@@ -524,7 +518,12 @@ func (t *testController) ChainHeight() uint64 {
+ }
+ 
+ func (t *testController) ProduceProposal(_ *ByzantineEvidence, _ *crypto.VDF) (rcBuildHeight uint64, block []byte, results *lib.CertificateResult, err lib.ErrorI) {
+-	block = t.NewTestBlock()
++	proposal := t.newTestBlock()
++	proposal.BlockHeader.Time = t.proposalTime
++	block, err = lib.Marshal(proposal)
++	if err != nil {
++		return
++	}
+ 	results = &lib.CertificateResult{
+ 		RewardRecipients: &lib.RewardRecipients{
+ 			PaymentPercents: []*lib.PaymentPercents{{
+@@ -546,6 +545,9 @@ func (t *testController) ValidateProposal(_ uint64, qc *lib.QuorumCertificate, _
+ }
+ 
+ func (t *testController) LoadCommittee(rootChainId, rootHeight uint64) (lib.ValidatorSet, lib.ErrorI) {
++	if t.loadCommitteeErr != nil {
++		return lib.ValidatorSet{}, t.loadCommitteeErr
++	}
+ 	return t.valSet[rootChainId], nil
+ }
+ func (t *testController) LoadCertificate(_ uint64) (*lib.QuorumCertificate, lib.ErrorI) {
+@@ -571,9 +573,15 @@ func (t *testController) LoadMinimumEvidenceHeight(_, _ uint64) (*uint64, lib.Er
+ func (t *testController) IsValidDoubleSigner(_, _ uint64, _ []byte) bool { return true }
+ func (t *testController) Syncing() *atomic.Bool                          { return &atomic.Bool{} }
+ func (t *testController) LoadCommitteeData() (*lib.CommitteeData, lib.ErrorI) {
++	if t.loadCommitteeDataErr != nil {
++		return nil, t.loadCommitteeDataErr
++	}
++	if t.committeeData != nil {
++		return t.committeeData, nil
++	}
+ 	return &lib.CommitteeData{}, nil
+ }
+-func (t *testController) RootChainHeight() uint64 { return 0 }
++func (t *testController) RootChainHeight() uint64 { return t.rootHeight }
+ func (t *testController) LoadLastProposers(_ uint64) (*lib.Proposers, lib.ErrorI) {
+ 	return t.proposers, nil
+ }
+diff --git a/bft/msg.go b/bft/msg.go
+index ef54b4a7..8fab85cc 100644
+--- a/bft/msg.go
++++ b/bft/msg.go
+@@ -13,6 +13,21 @@ func (b *BFT) HandleMessage(message proto.Message) lib.ErrorI {
+ 	// ensure is a valid `Consensus Message` type
+ 	switch msg := message.(type) {
+ 	case *Message:
++		if msg == nil {
++			return ErrEmptyMessage()
++		}
++		// Reject obsolete VRF election proposals before validator lookup, locking, or signature verification.
++		if b.usesDeterministicProposers() && msg != nil && msg.Header != nil && msg.Header.Phase == Election {
++			return lib.ErrWrongPhase()
++		}
++		if err := checkSignatureBasic(msg.Signature); err != nil {
++			return err
++		}
++		if b.usesDeterministicProposers() {
++			if handled, err := b.deferFutureMessage(msg); handled {
++				return err
++			}
++		}
+ 		// capture the parameters needed to validate the message
+ 		params, err := b.GetValidateMessageParams(msg)
+ 		if err != nil {
+@@ -31,7 +46,11 @@ func (b *BFT) HandleMessage(message proto.Message) lib.ErrorI {
+ 				return b.AddPacemakerMessage(msg)
+ 			}
+ 			// store Vote
+-			return b.AddVote(msg)
++			if err = b.AddVote(msg); err != nil {
++				return err
++			}
++			b.SignalPhaseAdvance()
++			return nil
+ 		case msg.IsProposerMessage(): // consensus message from the Leader
+ 			// validate the Leader message
+ 			partialQC, err := b.CheckProposerMessage(msg, params)
+@@ -46,33 +65,101 @@ func (b *BFT) HandleMessage(message proto.Message) lib.ErrorI {
+ 				return b.AddPartialQC(msg)
+ 			}
+ 			// store Proposal
+-			return b.AddProposal(msg)
++			if err = b.AddProposal(msg); err != nil {
++				return err
++			}
++			b.SignalPhaseAdvance()
++			return nil
+ 		}
+ 	}
+ 	return ErrUnknownConsensusMsg(message)
+ }
+ 
++const (
++	maxFutureMessages          = 256
++	maxFutureMessagesPerSigner = 8
++	maxFutureMessageBytes      = lib.GlobalMaxBlockSize
++)
++
++// deferFutureMessage() holds a bounded one-height lookahead until ResetBFT publishes the matching height and committee snapshot.
++func (b *BFT) deferFutureMessage(msg *Message) (bool, lib.ErrorI) {
++	view := msg.GetHeader()
++	if view == nil {
++		view = msg.GetQc().GetHeader()
++	}
++	b.Controller.Lock()
++	defer b.Controller.Unlock()
++	if view == nil || view.Height != b.Height+1 {
++		return false, nil
++	}
++	height := view.Height
++	// Authenticate membership against the message's claimed committee snapshot before retaining it.
++	// Full view and proposal validation still waits until the local height has advanced.
++	validators := b.ValidatorSet
++	if view.RootHeight != b.RootHeight {
++		var err lib.ErrorI
++		validators, err = b.LoadCommittee(b.LoadRootChainId(b.Height), view.RootHeight)
++		if err != nil {
++			return true, err
++		}
++	}
++	if _, err := validators.GetValidator(msg.Signature.PublicKey); err != nil {
++		return true, err
++	}
++	size := proto.Size(msg)
++	if len(b.futureMsgs) >= maxFutureMessages || size > maxFutureMessageBytes-b.futureBytes {
++		return true, lib.ErrWrongCertHeight(height, b.Height)
++	}
++	signerMessages := 0
++	for _, deferred := range b.futureMsgs {
++		if bytes.Equal(deferred.Signature.PublicKey, msg.Signature.PublicKey) {
++			signerMessages++
++		}
++	}
++	if signerMessages >= maxFutureMessagesPerSigner {
++		return true, lib.ErrWrongCertHeight(height, b.Height)
++	}
++	// Verify the signed payload before consuming the lookahead; full view validation runs after reset.
++	if err := checkSignature(msg.Signature, msg); err != nil {
++		return true, err
++	}
++	b.futureMsgs = append(b.futureMsgs, msg)
++	b.futureHeight = height
++	b.futureBytes += size
++	return true, nil
++}
++
++// takeFutureMessages() removes and returns buffered messages for the requested height.
++// The caller holds the controller lock shared with deferFutureMessage().
++func (b *BFT) takeFutureMessages(height uint64) []*Message {
++	if len(b.futureMsgs) == 0 || b.futureHeight != height {
++		return nil // preserve H+1 messages across a same-height committee reset
++	}
++	messages := b.futureMsgs
++	b.futureMsgs, b.futureHeight, b.futureBytes = nil, 0, 0
++	return messages
++}
++
+ // CheckProposerMessage() validates an inbound message from the Leader Validator
+ func (b *BFT) CheckProposerMessage(x *Message, p *validateMessageParams) (isPartialQC bool, err lib.ErrorI) {
++	if b.usesDeterministicProposers() && x != nil && x.Header != nil && x.Header.Phase == Election {
++		return false, lib.ErrWrongPhase()
++	}
+ 	// basic sanity checks on the message
+ 	if err = x.checkBasic(p.view); err != nil {
+ 		return false, err
+ 	}
+-	// ELECTION
+ 	if x.Header.Phase == Election {
+-		// validate target height
+ 		if x.Header.Height != p.height {
+ 			return false, lib.ErrWrongCertHeight(x.Header.Height, p.height)
+ 		}
+-		// sanity check the VRF
+ 		if err = checkSignatureBasic(x.Vrf); err != nil {
+ 			return false, err
+ 		}
+-		// ensure the VRF is for the sender
+ 		if !bytes.Equal(x.Signature.PublicKey, x.Vrf.PublicKey) {
+ 			return false, ErrMismatchPublicKeys()
+ 		}
+-		return
++		return false, nil
+ 	}
+ 	// PROPOSE, PRECOMMIT, COMMIT
+ 	var vals = p.vals
+@@ -107,6 +194,18 @@ func (b *BFT) CheckProposerMessage(x *Message, p *validateMessageParams) (isPart
+ 	if err != nil {
+ 		return
+ 	}
++	// Fresh round zero accepts the deterministic proposer's one-signer proof, while committee resets and block commits still require their normal quorums.
++	if b.usesDeterministicProposers() && isPartialQC && x.Header.Phase == Propose && x.Header.Round == 0 && !p.roundZeroNewView {
++		var signers [][]byte
++		signers, _, err = x.Qc.Signature.GetSigners(vals)
++		if err != nil {
++			return false, err
++		}
++		if len(signers) != 1 || !bytes.Equal(signers[0], x.Signature.PublicKey) || !bytes.Equal(x.Signature.PublicKey, p.proposerKey) {
++			return false, lib.ErrInvalidSigner()
++		}
++		isPartialQC = false
++	}
+ 	if x.HighQc != nil {
+ 		if err = x.HighQc.CheckBasic(); err != nil {
+ 			return false, err
+@@ -331,6 +430,8 @@ func (b *BFT) GetValidateMessageParams(msg *Message) (*validateMessageParams, li
+ 		cHeightUpdated:    b.CommitteeData.LastChainHeightUpdated,
+ 		blockHash:         blockHash,
+ 		resultsHash:       resultsHash,
++		proposerKey:       bytes.Clone(b.ProposerKey),
++		roundZeroNewView:  b.roundZeroNewView,
+ 	}, nil
+ }
+ 
+@@ -344,6 +445,8 @@ type validateMessageParams struct {
+ 	cHeightUpdated    uint64    // the last 'chain' height the committee updated
+ 	blockHash         []byte    // the hash of the proposal.Block (if any)
+ 	resultsHash       []byte    // the hash of the proposal.Results (if any)
++	proposerKey       []byte    // deterministic proposer captured with the view
++	roundZeroNewView  bool      // whether round zero requires a lock-carrying new-view quorum
+ }
+ 
+ // checkSignature() validates the signature of a SignByte implementation (object that can be converted to Sign Bytes)
+diff --git a/bft/msg_test.go b/bft/msg_test.go
+index 510d725b..7283313b 100644
+--- a/bft/msg_test.go
++++ b/bft/msg_test.go
+@@ -1,10 +1,13 @@
+ package bft
+ 
+ import (
++	"testing"
++	"time"
++
+ 	"github.com/canopy-network/canopy/lib"
+ 	"github.com/canopy-network/canopy/lib/crypto"
+ 	"github.com/stretchr/testify/require"
+-	"testing"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ func TestSignBytes(t *testing.T) {
+@@ -147,6 +150,18 @@ func TestSignBytes(t *testing.T) {
+ 	}
+ }
+ 
++// TestObsoleteElectionProposalIsRejectedBeforeValidation() verifies deterministic mode rejects obsolete election proposals early.
++func TestObsoleteElectionProposalIsRejectedBeforeValidation(t *testing.T) {
++	c := newTestConsensus(t, Election, 3)
++	msg := &Message{Header: c.view(Election)}
++
++	require.True(t, msg.IsProposerMessage())
++	err := c.bft.HandleMessage(msg)
++	require.Error(t, err)
++	require.Equal(t, lib.CodeWrongPhase, err.Code())
++	require.Empty(t, c.bft.Proposals[0][phaseToString(Election)])
++}
++
+ func TestProposerMessageQCRejectsWrongRootHeightForJustification(t *testing.T) {
+ 	c := newTestConsensus(t, Propose, 3)
+ 
+@@ -243,18 +258,148 @@ func TestHandleMessageNilSignatureReturnsError(t *testing.T) {
+ 	require.Equal(t, ErrPartialSignatureEmpty().Code(), errI.Code())
+ }
+ 
++// TestNextHeightMessageWaitsForBlockReset() verifies next-height messages remain buffered until the block reset.
++func TestNextHeightMessageWaitsForBlockReset(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	msg := &Message{Header: c.view(Propose)}
++	msg.Header.Height++
++	require.NoError(t, msg.Sign(c.valKeys[0]))
++
++	// The message is not validated against height 1 and lost; it is retained until the block listener advances consensus to its height.
++	require.NoError(t, c.bft.HandleMessage(msg))
++	require.Len(t, c.bft.futureMsgs, 1)
++	require.Equal(t, proto.Size(msg), c.bft.futureBytes)
++	require.Empty(t, c.bft.Proposals[msg.Header.Round][phaseToString(msg.Header.Phase)])
++	require.Nil(t, c.bft.takeFutureMessages(c.bft.Height))
++	require.Len(t, c.bft.futureMsgs, 1)
++
++	c.bft.Height = msg.Header.Height
++	deferred := c.bft.takeFutureMessages(c.bft.Height)
++	require.Equal(t, []*Message{msg}, deferred)
++	require.Empty(t, c.bft.futureMsgs)
++	require.Zero(t, c.bft.futureBytes)
++}
++
++// TestNextHeightMessageRejectedWhenFutureBufferIsFull() verifies the future-message buffer remains bounded.
++func TestNextHeightMessageRejectedWhenFutureBufferIsFull(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	c.bft.futureBytes = maxFutureMessageBytes
++	msg := &Message{Header: c.view(Propose)}
++	msg.Header.Height++
++	require.NoError(t, msg.Sign(c.valKeys[0]))
++
++	require.Error(t, c.bft.HandleMessage(msg))
++	require.Empty(t, c.bft.futureMsgs)
++}
++
++func TestNextHeightMessageFromNonMemberIsNotDeferred(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	key, err := crypto.NewBLS12381PrivateKey()
++	require.NoError(t, err)
++	msg := &Message{Header: c.view(Propose)}
++	msg.Header.Height++
++	require.NoError(t, msg.Sign(key))
++
++	require.Error(t, c.bft.HandleMessage(msg))
++	require.Empty(t, c.bft.futureMsgs)
++	require.Zero(t, c.bft.futureBytes)
++}
++
++func TestNextHeightMessagesAreBoundedPerSigner(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	for round := uint64(0); round < maxFutureMessagesPerSigner; round++ {
++		msg := &Message{Header: c.view(Propose, round)}
++		msg.Header.Height++
++		require.NoError(t, msg.Sign(c.valKeys[0]))
++		require.NoError(t, c.bft.HandleMessage(msg))
++	}
++	msg := &Message{Header: c.view(Propose, maxFutureMessagesPerSigner)}
++	msg.Header.Height++
++	require.NoError(t, msg.Sign(c.valKeys[0]))
++
++	require.Error(t, c.bft.HandleMessage(msg))
++	require.Len(t, c.bft.futureMsgs, maxFutureMessagesPerSigner)
++}
++
++// TestNextHeightPacemakerWaitsForResetBeforeRoundWindowCheck() verifies next-height pacemaker messages wait for reset before round validation.
++func TestNextHeightPacemakerWaitsForResetBeforeRoundWindowCheck(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	c.bft.Round = 5
++	c.bft.round.Store(5)
++	msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, 0)}}
++	msg.Qc.Header.Height++
++	require.NoError(t, msg.Sign(c.valKeys[0]))
++
++	require.NoError(t, c.bft.HandleMessage(msg))
++	require.Equal(t, []*Message{msg}, c.bft.futureMsgs)
++}
++
++// TestLegacyModeDoesNotBufferNextHeightMessage() verifies legacy mode does not use deterministic next-height buffering.
++func TestLegacyModeDoesNotBufferNextHeightMessage(t *testing.T) {
++	c := newTestConsensus(t, Propose, 3)
++	c.bft.Config.ProposerMode = lib.ProposerModeVRF
++	msg := &Message{Header: c.view(Propose)}
++	msg.Header.Height++
++	require.NoError(t, msg.Sign(c.valKeys[0]))
++
++	require.Error(t, c.bft.HandleMessage(msg))
++	require.Empty(t, c.bft.futureMsgs)
++}
++
+ func TestPacemakerMessageSignatureBindsClaimedRound(t *testing.T) {
+ 	c := newTestConsensus(t, Propose, 3)
+-	msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, 1)}}
++	msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, 0)}}
+ 	require.NoError(t, msg.Sign(c.valKeys[1]))
+ 
+-	msg.Qc.Header.Round = 2
++	msg.Qc.Header.Round = 1
+ 
+ 	errI := c.bft.HandleMessage(msg)
+ 	require.Error(t, errI)
+ 	require.Equal(t, ErrInvalidPartialSignature().Code(), errI.Code())
+ }
+ 
++// TestPacemakerMessageAllowsArbitraryHigherRoundCatchUp() verifies authenticated pacemaker evidence permits higher-round catch-up.
++func TestPacemakerMessageAllowsArbitraryHigherRoundCatchUp(t *testing.T) {
++	c := newTestConsensus(t, Propose, 4)
++	for _, validator := range []int{1, 2} {
++		msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, 3)}}
++		require.NoError(t, msg.Sign(c.valKeys[validator]))
++		require.NoError(t, c.bft.HandleMessage(msg))
++	}
++
++	round, ok := c.bft.TimeoutCatchUpRound()
++	require.True(t, ok)
++	require.Equal(t, uint64(3), round)
++	c.bft.SetHeightAnchor(time.Now())
++	newViewSent := make(chan struct{})
++	go func() {
++		<-c.cont.sendToProposerChan
++		close(newViewSent)
++	}()
++	c.bft.Controller.Lock()
++	c.bft.advanceReadyPhases()
++	c.bft.Controller.Unlock()
++	<-newViewSent
++	require.Equal(t, uint64(3), c.bft.Round)
++	c.bft.PhaseTimer.Stop()
++}
++
++// TestPacemakerMessageRetentionIsBoundedAcrossRounds() verifies retained pacemaker votes remain bounded across rounds.
++func TestPacemakerMessageRetentionIsBoundedAcrossRounds(t *testing.T) {
++	c := newTestConsensus(t, Propose, 1)
++	for round := uint64(0); round < 100; round++ {
++		msg := &Message{Qc: &QC{Header: c.view(RoundInterrupt, round)}}
++		require.NoError(t, msg.Sign(c.valKeys[0]))
++		require.NoError(t, c.bft.HandleMessage(msg))
++		require.LessOrEqual(t, len(c.bft.PacemakerMessages), maxPacemakerMessagesPerSigner)
++	}
++	rounds := make([]uint64, 0, maxPacemakerMessagesPerSigner)
++	for _, msg := range c.bft.PacemakerMessages {
++		rounds = append(rounds, msg.Qc.Header.Round)
++	}
++	require.ElementsMatch(t, []uint64{98, 99}, rounds)
++}
++
+ func TestProposerMessageRejectsInvalidHighQC(t *testing.T) {
+ 	c := newTestConsensus(t, Propose, 3)
+ 	justifyPropose := c.simElectionVotePhase(t, 0, false, false, false, 0)
+diff --git a/bft/prop.go b/bft/prop.go
+index fddb5cb0..02b47527 100644
+--- a/bft/prop.go
++++ b/bft/prop.go
+@@ -10,17 +10,24 @@ import (
+ // PROPOSALS RECEIVED FROM PROPOSER FOR CURRENT HEIGHT
+ 
+ // NOTE: A 'Proposal' is a message from the Leader (Proposer) asking for votes from Replicas.
+-// The Proposal is valid (justified) if it is backed by either:
+-//   - A Verifiable Random Function (VRF)
+-//   - A Quorum Certificate, votes from +2/3rds of the Replica for the previous Phase
++// The Proposal is valid when backed by a Quorum Certificate with votes from +2/3rds of Replicas for the previous phase.
+ // The Leader must gather these votes to organize consensus in the current Phase and lead the set through the stages of BFT.
+ 
+ // ProposalsForHeight are an in-memory list of messages received from the Leader
+-// NOTE: an array of Messages is required for the ELECTION phase as there can be multiple proposals if there is multiple Candidates
+ type ProposalsForHeight map[uint64]map[string][]*Message // [ROUND][PHASE] -> PROPOSAL(s)
+ 
+ // AddProposal() saves a validated proposal from the Leader in memory
+ func (b *BFT) AddProposal(m *Message) lib.ErrorI {
++	if m == nil {
++		return ErrEmptyMessage()
++	}
++	if m.Header == nil {
++		return lib.ErrEmptyView()
++	}
++	// Never retain proposals from the retired VRF election protocol, even if an internal caller bypasses HandleMessage.
++	if b.usesDeterministicProposers() && m.Header.Phase == Election {
++		return lib.ErrWrongPhase()
++	}
+ 	b.Controller.Lock()
+ 	defer b.Controller.Unlock()
+ 	// load the list of Proposals for the round
+@@ -31,25 +38,16 @@ func (b *BFT) AddProposal(m *Message) lib.ErrorI {
+ 	}
+ 	// define convenience variables
+ 	phase := m.Header.Phase
+-	phaseProposal := roundProposal[phaseToString(phase)]
+-	// if it's an Election Proposal, add to the list (multiple candidates)
+-	// else overwrite the Proposal (this is ok because Proposer ID is previously authenticated after the ELECTION phase)
+ 	if m.Header.Phase == Election {
+-		// check to see if the candidate is already on the list
+-		// this may happen during a NEW_COMMITTEE reset
+-		alreadyExists := slices.ContainsFunc(roundProposal[phaseToString(phase)], func(compare *Message) bool {
+-			if compare == nil || compare.Qc == nil || m == nil || m.Qc == nil {
+-				return false
+-			}
+-			return bytes.Equal(m.Qc.ProposerKey, compare.Qc.ProposerKey)
++		phaseProposal := roundProposal[phaseToString(phase)]
++		alreadyExists := slices.ContainsFunc(phaseProposal, func(compare *Message) bool {
++			return compare != nil && compare.Qc != nil && m.Qc != nil && bytes.Equal(m.Qc.ProposerKey, compare.Qc.ProposerKey)
+ 		})
+-		// if candidate not already on the list
+ 		if !alreadyExists {
+-			// add to the list
+ 			roundProposal[phaseToString(phase)] = append(phaseProposal, m)
+ 		}
+ 	} else {
+-		// overwrite the proposal
++		// The proposer is already authenticated, so there is one proposal per phase.
+ 		roundProposal[phaseToString(phase)] = []*Message{m}
+ 	}
+ 	// add to the global list
+@@ -62,8 +60,9 @@ func (b *BFT) ProposalsResetForNewCommittee() {
+ 	// initialize a new proposals map for the current height
+ 	propsForHeight := make(ProposalsForHeight)
+ 	propsForHeight[0] = make(map[string][]*Message)
+-	// preserve R0 election candidates to ensure messages sent before the reset are not lost
+-	propsForHeight[0][phaseToString(Election)] = b.Proposals[0][phaseToString(Election)]
++	if !b.usesDeterministicProposers() {
++		propsForHeight[0][phaseToString(Election)] = b.Proposals[0][phaseToString(Election)]
++	}
+ 	// replace existing proposals with the new structure
+ 	b.Proposals = propsForHeight
+ }
+@@ -71,10 +70,19 @@ func (b *BFT) ProposalsResetForNewCommittee() {
+ // GetProposal() retrieves a proposal from the leader at the latest View
+ func (b *BFT) GetProposal() *Message { return b.getProposal(b.Round, b.Phase) }
+ 
++// getProposalAtPhase() returns a proposal whose header exactly matches phase for event-driven advancement across a corresponding leader phase.
++func (b *BFT) getProposalAtPhase(round uint64, phase Phase) *Message {
++	proposals := b.Proposals[round][phaseToString(phase)]
++	if len(proposals) == 0 {
++		return nil
++	}
++	return proposals[0]
++}
++
+ // getProposal() retrieves a proposal from the leader at the Round.Phase
+ func (b *BFT) getProposal(round uint64, phase Phase) *Message {
+ 	proposal, found := b.Proposals[round][phaseToString(phase-1)]
+-	if !found {
++	if !found || len(proposal) == 0 {
+ 		return nil
+ 	}
+ 	return proposal[0]
+diff --git a/bft/prop_test.go b/bft/prop_test.go
+index 88f5b58a..26f0dfb9 100644
+--- a/bft/prop_test.go
++++ b/bft/prop_test.go
+@@ -18,18 +18,8 @@ func TestAddProposal(t *testing.T) {
+ 		error   string
+ 	}{
+ 		{
+-			name:   "same phase",
+-			detail: "a message for this view was already received but it was from a different proposer",
+-			preAdd: []*Message{
+-				{
+-					Header: &lib.View{
+-						Phase: lib.Phase_ELECTION,
+-					},
+-					Signature: &lib.Signature{
+-						PublicKey: keys[0].PublicKey().Bytes(),
+-					},
+-				},
+-			},
++			name:   "obsolete election proposal",
++			detail: "deterministic election does not store VRF candidates",
+ 			message: &Message{
+ 				Header: &lib.View{
+ 					Phase: lib.Phase_ELECTION,
+@@ -38,6 +28,7 @@ func TestAddProposal(t *testing.T) {
+ 					PublicKey: keys[1].PublicKey().Bytes(),
+ 				},
+ 			},
++			error: "wrong phase",
+ 		},
+ 
+ 		{
+@@ -46,7 +37,7 @@ func TestAddProposal(t *testing.T) {
+ 			preAdd: []*Message{
+ 				{
+ 					Header: &lib.View{
+-						Phase: lib.Phase_ELECTION,
++						Phase: lib.Phase_PROPOSE,
+ 					},
+ 					Signature: &lib.Signature{
+ 						PublicKey: keys[0].PublicKey().Bytes(),
+@@ -55,7 +46,7 @@ func TestAddProposal(t *testing.T) {
+ 			},
+ 			message: &Message{
+ 				Header: &lib.View{
+-					Phase: lib.Phase_PROPOSE,
++					Phase: lib.Phase_PRECOMMIT,
+ 				},
+ 				Signature: &lib.Signature{
+ 					PublicKey: keys[1].PublicKey().Bytes(),
+diff --git a/controller/block.go b/controller/block.go
+index 558aa621..83e4e64a 100644
+--- a/controller/block.go
++++ b/controller/block.go
+@@ -130,6 +130,9 @@ func (c *Controller) SelfSendBlock(qc *lib.QuorumCertificate, timestamp uint64)
+ func (c *Controller) ProduceProposal(evidence *bft.ByzantineEvidence, vdf *crypto.VDF) (rcBuildHeight uint64, blockBytes []byte, results *lib.CertificateResult, err lib.ErrorI) {
+ 	var clean bool
+ 	c.log.Debugf("Producing proposal as leader")
++	c.Mempool.proposalGate.Lock()
++	defer c.Mempool.proposalGate.Unlock()
++	// Wait for consensus-critical finalized-height preparation instead of cancelling and rebuilding the same block on the live path.
+ 	// once done proposing, 'reset' the proposal mode back to default to 'accept all'
+ 	defer c.FSM.Reset()
+ 	// loop until we get a clean pass to prevent mid-proposal races
+@@ -155,6 +158,15 @@ func (c *Controller) ProduceProposal(evidence *bft.ByzantineEvidence, vdf *crypt
+ 					return false, e
+ 				}
+ 			}
++			// Timestamp a cached proposal at transmission so its shared next-height deadline is not stale when the block finalizes.
++			if c.Config.ConsensusConfig.UsesDeterministicProposers() {
++				proposalTime := time.Now()
++				if lastBlock.BlockHeader.Time != 0 {
++					proposalTime = nextProposalTime(lastBlock.BlockHeader.Time, time.Now(),
++						c.Config.ConsensusConfig.RoundRobinBlockInterval(), c.Config.ConsensusConfig.BlockConsensusLeadTime())
++				}
++				p.Block.BlockHeader.Time = uint64(proposalTime.UnixMicro())
++			}
+ 			// validate the verifiable delay function from the bft module
+ 			if c.FSM.Height() > 1 && vdf != nil {
+ 				// if the verifiable delay function is NOT valid for using the last block hash
+@@ -197,6 +209,8 @@ func (c *Controller) ProduceProposal(evidence *bft.ByzantineEvidence, vdf *crypt
+ 
+ // ValidateProposal() fully validates a proposal in the form of a quorum certificate and resets back to begin block state
+ func (c *Controller) ValidateProposal(rcBuildHeight uint64, qc *lib.QuorumCertificate, evidence *bft.ByzantineEvidence) (blockResult *lib.BlockResult, err lib.ErrorI) {
++	// Cancel speculative mempool work so it does not compete with consensus-critical proposal validation.
++	c.Mempool.cancelProposalBuild()
+ 	// reset the mempool at the beginning of the function to preserve the state for CommitCertificate()
+ 	c.FSM.Reset()
+ 	// log the beginning of proposal validation
+@@ -211,6 +225,13 @@ func (c *Controller) ValidateProposal(rcBuildHeight uint64, qc *lib.QuorumCertif
+ 		// exit with error
+ 		return
+ 	}
++	// Enforce this liveness bound outside the FSM so a proposal cannot park consensus far in the future.
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() {
++		maximumTime := uint64(time.Now().Add(c.Config.ConsensusConfig.MaximumFutureBlockTime()).UnixMicro())
++		if block.BlockHeader.Time > maximumTime {
++			return nil, lib.ErrFutureBlockTime(block.BlockHeader.Time, maximumTime)
++		}
++	}
+ 	// validate the byzantine evidence portion of the proposal (bft is canopy controlled)
+ 	if err = c.Consensus.ValidateByzantineEvidence(qc.Results.SlashRecipients, evidence); err != nil {
+ 		// exit with error
+@@ -242,6 +263,33 @@ func (c *Controller) ValidateProposal(rcBuildHeight uint64, qc *lib.QuorumCertif
+ 	return
+ }
+ 
++// nextProposalTime() returns the first target slot with enough consensus lead time in constant time.
++func nextProposalTime(previous uint64, now time.Time, targetInterval, leadTime time.Duration) time.Time {
++	intervalMicros := uint64(targetInterval / time.Microsecond)
++	next := previous + intervalMicros
++	minimum := uint64(now.Add(leadTime).UnixMicro())
++	if next < minimum {
++		delta := minimum - next
++		slots := delta / intervalMicros
++		if delta%intervalMicros != 0 {
++			slots++
++		}
++		next += slots * intervalMicros
++	}
++	return time.UnixMicro(int64(next))
++}
++
++// validateProposalTime() rejects proposal timestamps that are not strictly newer than the previous block.
++func validateProposalTime(proposed uint64, previous *lib.BlockResult) lib.ErrorI {
++	if previous == nil || previous.BlockHeader == nil {
++		return lib.ErrNilBlockHeader()
++	}
++	if proposed <= previous.BlockHeader.Time {
++		return lib.ErrNonMonotonicBlockTime(proposed, previous.BlockHeader.Time)
++	}
++	return nil
++}
++
+ // CommitCertificate() is executed after the quorum agrees on a block
+ // - applies block against the fsm
+ // - indexes the block and its transactions
+@@ -253,8 +301,7 @@ func (c *Controller) CommitCertificate(qc *lib.QuorumCertificate, block *lib.Blo
+ 	start := time.Now()
+ 	syncing := c.isSyncing.Load()
+ 	if !syncing {
+-		// cancel any running mempool check and lock the mempool for live operation
+-		c.Mempool.stop()
++		c.Mempool.cancelProposalBuild()
+ 		c.Mempool.L.Lock()
+ 		defer c.Mempool.L.Unlock()
+ 	}
+@@ -320,21 +367,17 @@ func (c *Controller) CommitCertificate(qc *lib.QuorumCertificate, block *lib.Blo
+ 		return err
+ 	}
+ 	if !syncing {
+-		// refresh the mempool FSM from the newly committed height before rebuilding
++		// Keep each validator's next-height proposal warm so the selected leader can transmit immediately.
+ 		c.Mempool.FSM.Discard()
+ 		if c.Mempool.FSM, err = c.FSM.Copy(); err != nil {
+ 			return err
+ 		}
+-		// check the mempool to cache a proposal block and validate the mempool itself
+ 		c.Mempool.dirtyVersion.Add(1)
+ 		resetProposalConfig := c.SetFSMInConsensusModeForProposals()
+ 		if e := c.Mempool.CheckMempool(); e != nil {
+-			resetProposalConfig()
+ 			c.log.Warnf("Post-commit mempool rebuild failed: %s", e.Error())
+-		} else {
+-			resetProposalConfig()
+ 		}
+-		// reset mempool FSM
++		resetProposalConfig()
+ 		c.Mempool.FSM.Reset()
+ 	}
+ 	// update telemetry (using proper defer to ensure time.Since is evaluated at defer execution)
+@@ -369,7 +412,7 @@ func (c *Controller) CommitCertificateParallel(qc *lib.QuorumCertificate, block
+ 	syncing := c.isSyncing.Load()
+ 	if !syncing {
+ 		// cancel any running mempool check and lock the mempool for live operation
+-		c.Mempool.stop()
++		c.Mempool.cancelProposalBuild()
+ 		c.Mempool.L.Lock()
+ 		defer c.Mempool.L.Unlock()
+ 	}
+@@ -517,6 +560,15 @@ func (c *Controller) commitToStore(storeI lib.StoreI, qc *lib.QuorumCertificate,
+ func (c *Controller) ApplyAndValidateBlock(block *lib.Block, commit bool) (b *lib.BlockResult, err lib.ErrorI) {
+ 	// define convenience variables for the block header, hash, and height
+ 	candidate, candidateHash, candidateHeight := block.BlockHeader, lib.BytesToString(block.BlockHeader.Hash), block.BlockHeader.Height
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() && candidateHeight > 1 {
++		lastBlock, loadErr := c.FSM.LoadBlock(candidateHeight - 1)
++		if loadErr != nil {
++			return nil, loadErr
++		}
++		if timeErr := validateProposalTime(candidate.Time, lastBlock); timeErr != nil {
++			return nil, timeErr
++		}
++	}
+ 	// check the last qc in the candidate and set it in the ephemeral indexer to prepare for block application
+ 	if err = c.CheckAndSetLastCertificate(candidate); err != nil {
+ 		// exit with error
+@@ -641,6 +693,10 @@ func (c *Controller) handlePeerBlock(msg *lib.BlockMessage, syncing, verifyQC bo
+ 		// exit with error
+ 		return nil, err
+ 	}
++	// Normalize the compatibility transport timestamp to the QC-authenticated block timestamp before commit, gossip, and ResetBFT.
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() {
++		msg.Time = block.BlockHeader.Time
++	}
+ 	// create a temp variable to double-check our saved block result against the peers
+ 	result := c.Consensus.BlockResult
+ 	// if our cached result is the same as the peer block, use that
+diff --git a/controller/block_test.go b/controller/block_test.go
+index 21f62054..a1add132 100644
+--- a/controller/block_test.go
++++ b/controller/block_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"reflect"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
+ 	"unsafe"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -14,6 +15,38 @@ import (
+ 	"github.com/canopy-network/canopy/lib/crypto"
+ )
+ 
++// TestNextProposalTimeSkipsOldSlotsArithmetically() verifies stale proposal slots are skipped arithmetically.
++func TestNextProposalTimeSkipsOldSlotsArithmetically(t *testing.T) {
++	interval := 750 * time.Millisecond
++	leadTime := 225 * time.Millisecond
++	previous := uint64(time.Unix(1, 0).UnixMicro())
++	now := time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC)
++	got := nextProposalTime(previous, now, interval, leadTime)
++	minimum := now.Add(leadTime)
++
++	require.False(t, got.Before(minimum))
++	intervalMicros := uint64(interval / time.Microsecond)
++	require.Zero(t, (uint64(got.UnixMicro())-(previous+intervalMicros))%intervalMicros)
++}
++
++// TestNextProposalTimeUsesImmediateNextSlotWhenReady() verifies the immediate next slot is used when sufficient lead time remains.
++func TestNextProposalTimeUsesImmediateNextSlotWhenReady(t *testing.T) {
++	now := time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC)
++	previous := uint64(now.UnixMicro())
++	config := lib.DefaultConsensusConfig()
++	interval := config.RoundRobinBlockInterval()
++	require.True(t, now.Add(interval).Equal(nextProposalTime(previous, now, interval, config.BlockConsensusLeadTime())))
++}
++
++// TestValidateProposalTimeRequiresMonotonicTimestamp() verifies proposal timestamps increase monotonically.
++func TestValidateProposalTimeRequiresMonotonicTimestamp(t *testing.T) {
++	previous := &lib.BlockResult{BlockHeader: &lib.BlockHeader{Time: 1_000}}
++	require.Error(t, validateProposalTime(999, previous))
++	require.Error(t, validateProposalTime(1_000, previous))
++	require.NoError(t, validateProposalTime(1_001, previous))
++	require.Error(t, validateProposalTime(1_001, nil))
++}
++
+ // failGetStore is a store whose Get() always fails, used to force GetAccount() and
+ // GetValidator() to return a nil result alongside an error, mirroring a store read failure.
+ type failGetStore struct {
+diff --git a/controller/consensus.go b/controller/consensus.go
+index e87052ae..91b42790 100644
+--- a/controller/consensus.go
++++ b/controller/consensus.go
+@@ -324,7 +324,8 @@ func (c *Controller) ListenForConsensus() {
+ 				return
+ 			}
+ 			// direct consensus messages must come from their signer; gossip messages may come from a relay
+-			if !validConsensusSender(msg.Sender.Address.PublicKey, bftMsg, c.P2P.GossipMode()) {
++			allowRelay := c.P2P.GossipMode() || (c.Config.ConsensusConfig.UsesDeterministicProposers() && bftMsg.IsPacemakerMessage())
++			if !validConsensusSender(msg.Sender.Address.PublicKey, bftMsg, allowRelay) {
+ 				return lib.ErrInvalidSigner()
+ 			}
+ 			// check and add the message to the cache to prevent duplicates
+@@ -366,6 +367,10 @@ func (c *Controller) ShouldGossip(msg *bft.Message) (gossip bool, exit bool) {
+ 	if !c.P2P.GossipMode() {
+ 		return
+ 	}
++	// Drop retired VRF election proposals before gossip regardless of their other fields.
++	if msg == nil || (c.Config.ConsensusConfig.UsesDeterministicProposers() && msg.Header != nil && msg.Header.Phase == bft.Election) {
++		return false, true
++	}
+ 	// gossip cases
+ 	switch {
+ 	case msg.IsProposerMessage():
+@@ -659,6 +664,7 @@ func (c *Controller) pollMaxHeight(backoff int) (max, minVDF uint64, syncingPeer
+ 	go c.RequestBlock(true)
+ 	// debug log the current status
+ 	c.log.Debug("Waiting for peer max heights")
++	timeout := time.After(p2p.PollMaxHeightTimeoutS * time.Second * time.Duration(backoff))
+ 	// loop until timeout case
+ 	for {
+ 		// block until one of the cases is satisfied
+@@ -694,7 +700,7 @@ func (c *Controller) pollMaxHeight(backoff int) (max, minVDF uint64, syncingPeer
+ 				maxHeight = int(blockMessage.MaxHeight)
+ 			}
+ 		// if a timeout occurred
+-		case <-time.After(p2p.PollMaxHeightTimeoutS * time.Second * time.Duration(backoff)):
++		case <-timeout:
+ 			// if the maximum height or vdf iterations remains unset
+ 			if maxHeight == -1 || minimumVDFIterations == -1 {
+ 				// log the status of no heights received
+diff --git a/controller/consensus_test.go b/controller/consensus_test.go
+new file mode 100644
+index 00000000..d7ae3802
+--- /dev/null
++++ b/controller/consensus_test.go
+@@ -0,0 +1,29 @@
++package controller
++
++import (
++	"testing"
++
++	"github.com/canopy-network/canopy/bft"
++	"github.com/canopy-network/canopy/lib"
++	"github.com/canopy-network/canopy/p2p"
++	"github.com/stretchr/testify/require"
++)
++
++// TestShouldGossipRejectsObsoleteElectionProposal() verifies obsolete election proposals are not gossiped in deterministic mode.
++func TestShouldGossipRejectsObsoleteElectionProposal(t *testing.T) {
++	network := new(p2p.P2P)
++	network.SetGossipMode(true)
++	config := lib.DefaultConfig()
++	config.ProposerMode = lib.ProposerModeStakeWeightedRoundRobin
++	c := &Controller{P2P: network, Config: config}
++	msg := &bft.Message{
++		Header: &lib.View{Phase: bft.Election},
++		// Extra fields must not let an ELECTION header masquerade as another
++		// message class and reach gossip.
++		Qc: &bft.QC{Header: &lib.View{Phase: bft.RoundInterrupt}},
++	}
++
++	gossip, exit := c.ShouldGossip(msg)
++	require.False(t, gossip)
++	require.True(t, exit)
++}
+diff --git a/controller/controller.go b/controller/controller.go
+index adaffbf6..9e2aa80c 100644
+--- a/controller/controller.go
++++ b/controller/controller.go
+@@ -210,6 +210,11 @@ func (c *Controller) UpdateRootChainInfo(info *lib.RootChainInfo) {
+ 	if info.Timestamp != 0 {
+ 		timestamp = time.UnixMicro(int64(info.Timestamp))
+ 	}
++	// Ignore self-root loopback updates already applied by CommitCertificate so a second reset cannot invalidate next-height votes.
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() && info.RootChainId == c.Config.ChainId {
++		c.UpdateP2PMustConnect(info.ValidatorSet)
++		return
++	}
+ 	c.Mempool.dirtyVersion.Add(1)
+ 	// if the last validator set is empty
+ 	if info.LastValidatorSet == nil || len(info.LastValidatorSet.ValidatorSet) == 0 {
+@@ -225,6 +230,10 @@ func (c *Controller) UpdateRootChainInfo(info *lib.RootChainInfo) {
+ 
+ // LoadCommittee() gets the ValidatorSet that is authorized to come to Consensus agreement on the Proposal for a specific height/chainId
+ func (c *Controller) LoadCommittee(rootChainId, rootHeight uint64) (lib.ValidatorSet, lib.ErrorI) {
++	// Read a root chain's committed local committee directly to avoid a network-delayed loopback snapshot after commit.
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() && rootChainId == c.Config.ChainId {
++		return c.FSM.LoadCommittee(c.Config.ChainId, rootHeight)
++	}
+ 	return c.RCManager.GetValidatorSet(rootChainId, c.Config.ChainId, rootHeight)
+ }
+ 
+@@ -520,6 +529,9 @@ func (c *Controller) ResetFSM() { c.FSM.Reset() }
+ // RootChainHeight() returns the height of the canopy root-chain
+ func (c *Controller) RootChainHeight() uint64 {
+ 	chainId, _ := c.FSM.GetRootChainId()
++	if c.Config.ConsensusConfig.UsesDeterministicProposers() && chainId == c.Config.ChainId {
++		return c.FSM.Height()
++	}
+ 	return c.RCManager.GetHeight(chainId)
+ }
+ 
+diff --git a/controller/controller_test.go b/controller/controller_test.go
+index f5a27337..631a415b 100644
+--- a/controller/controller_test.go
++++ b/controller/controller_test.go
+@@ -15,6 +15,12 @@ func TestValidConsensusSender(t *testing.T) {
+ 	require.True(t, validConsensusSender([]byte{1}, msg, false))
+ 	require.False(t, validConsensusSender([]byte{2}, msg, false))
+ 	require.True(t, validConsensusSender([]byte{2}, msg, true))
++	timeout := &bft.Message{
++		Qc:        &bft.QC{Header: &lib.View{Phase: bft.RoundInterrupt}},
++		Signature: &lib.Signature{PublicKey: []byte{1}},
++	}
++	require.False(t, validConsensusSender([]byte{2}, timeout, false))
++	require.True(t, validConsensusSender([]byte{2}, timeout, true))
+ 	require.False(t, validConsensusSender([]byte{1}, &bft.Message{}, true))
+ }
+ 
+diff --git a/controller/tx.go b/controller/tx.go
+index 0d138fd5..5b0617ea 100644
+--- a/controller/tx.go
++++ b/controller/tx.go
+@@ -181,10 +181,28 @@ type Mempool struct {
+ 	address         crypto.AddressI    // validator identity
+ 	cachedProposal  atomic.Value       // the cached block proposal set when mempool is 'checked'
+ 	dirtyVersion    atomic.Uint64      // a monotonic version tracking proposal inputs that invalidate the cache
++	proposalGate    sync.RWMutex       // gives a consensus-critical leader priority over new transaction admission
++	cancelL         sync.Mutex         // protects the active proposal-build cancellation function
+ 	stop            context.CancelFunc // the cancellable context of the mempool
+ 	log             lib.LoggerI        // the logger
+ }
+ 
++// cancelProposalBuild() safely asks an in-flight speculative mempool build to yield CPU to consensus validation.
++func (m *Mempool) cancelProposalBuild() {
++	m.cancelL.Lock()
++	defer m.cancelL.Unlock()
++	if m.stop != nil {
++		m.stop()
++	}
++}
++
++// setProposalBuildCancel() publishes the cancellation function for the active speculative proposal build.
++func (m *Mempool) setProposalBuildCancel(stop context.CancelFunc) {
++	m.cancelL.Lock()
++	m.stop = stop
++	m.cancelL.Unlock()
++}
++
+ type CachedProposal struct {
+ 	Block              *lib.Block
+ 	BlockResult        *lib.BlockResult
+@@ -228,7 +246,8 @@ func (m *Mempool) HandleTransactionAndVerifyRetained(tx, replace []byte) lib.Err
+ }
+ 
+ func (m *Mempool) handleTransactions(verifyRetained bool, replace []byte, tx ...[]byte) (err lib.ErrorI) {
+-	// lock the mempool
++	m.proposalGate.RLock()
++	defer m.proposalGate.RUnlock()
+ 	m.L.Lock()
+ 	defer m.L.Unlock()
+ 	// add a transaction to the mempool
+@@ -255,25 +274,22 @@ func (m *Mempool) handleTransactions(verifyRetained bool, replace []byte, tx ...
+ func (m *Mempool) CheckMempool() (err lib.ErrorI) {
+ 	startTime := time.Now()
+ 	m.log.Info("Validating mempool and caching a new proposal block")
+-	buildVersion := m.dirtyVersion.Load()
+-	// check if a validator
+-	// create the actual block structure with the maximum amount of transactions allowed or available in the mempool
+-	block := &lib.Block{
+-		BlockHeader:  &lib.BlockHeader{Time: uint64(time.Now().UnixMicro()), ProposerAddress: m.address.Bytes()},
+-		Transactions: m.GetTransactions(math.MaxUint64), // get all transactions in mempool - but apply block will only keep 'max-block' amount
++	maxBlockSize, err := m.FSM.GetMaxBlockSize()
++	if err != nil {
++		return err
+ 	}
+-	// capture the tentative block result using a new object reference
+-	blockResult, result := new(lib.BlockResult), new(lib.ApplyBlockResults)
+ 	// setup a context with cancel
+ 	ctx, stop := context.WithCancel(context.Background())
+ 	// set the cancel function
+-	m.stop = stop
++	m.setProposalBuildCancel(stop)
++	defer stop()
+ 	// calculate rc build height
+ 	ownRoot, err := m.FSM.LoadIsOwnRoot()
+ 	if err != nil {
+ 		m.log.Error(err.Error())
+ 	}
+ 	rcBuildHeight := uint64(0)
++	var rootDexBatch *lib.DexBatch
+ 	// if ownRoot
+ 	if ownRoot {
+ 		rcBuildHeight = m.FSM.Height()
+@@ -287,7 +303,6 @@ func (m *Mempool) CheckMempool() (err lib.ErrorI) {
+ 			rcBuildHeight = m.controller.RCManager.GetHeight(rootChainID)
+ 		}
+ 		// for nested chains fetch and cache the DEX root batch, liveness is handled on the certificate results
+-		var rootDexBatch *lib.DexBatch
+ 		rootDexBatch, err = m.controller.RCManager.GetDexBatch(rootChainID,
+ 			rcBuildHeight, m.controller.Config.ChainId, false)
+ 		if err != nil {
+@@ -302,21 +317,51 @@ func (m *Mempool) CheckMempool() (err lib.ErrorI) {
+ 			m.log.Warnf("Check Mempool skipped: unable to fetch root dex batch: %s", err.Error())
+ 			return
+ 		}
+-		m.FSM.SetRootDexCache(rootDexBatch)
+-	}
+-	// apply the block to the mempool FSM to get the result and validate the transactions
+-	applyBlockStartTime := time.Now()
+-	block.BlockHeader, result, err = m.FSM.ApplyBlock(ctx, block, true)
+-	applyBlockDuration := time.Since(applyBlockStartTime)
+-	if m.metrics != nil {
+-		m.metrics.ProposalApplyBlockTime.Observe(applyBlockDuration.Seconds())
+ 	}
+-	if err != nil {
+-		m.log.Warnf("Check Mempool error: %s", err.Error())
+-		if m.dirtyVersion.Load() == buildVersion {
+-			m.dirtyVersion.Add(1)
++	var (
++		block              *lib.Block
++		blockResult        *lib.BlockResult
++		result             *lib.ApplyBlockResults
++		buildVersion       uint64
++		applyBlockDuration time.Duration
++	)
++	for {
++		buildVersion = m.dirtyVersion.Load()
++		block = &lib.Block{
++			BlockHeader:  &lib.BlockHeader{Time: uint64(time.Now().UnixMicro()), ProposerAddress: m.address.Bytes()},
++			Transactions: m.GetTransactions(maxBlockSize),
+ 		}
+-		return err
++		if rootDexBatch != nil {
++			m.FSM.SetRootDexCache(rootDexBatch)
++		}
++		// Apply one block-sized prefix, evict failures, reset speculative state, and refill before caching.
++		applyBlockStartTime := time.Now()
++		block.BlockHeader, result, err = m.FSM.ApplyBlock(ctx, block, true)
++		applyDuration := time.Since(applyBlockStartTime)
++		applyBlockDuration += applyDuration
++		if m.metrics != nil {
++			m.metrics.ProposalApplyBlockTime.Observe(applyDuration.Seconds())
++		}
++		if err != nil {
++			m.log.Warnf("Check Mempool error: %s", err.Error())
++			if m.dirtyVersion.Load() == buildVersion {
++				m.dirtyVersion.Add(1)
++			}
++			return err
++		}
++		if len(result.Failed) == 0 {
++			break
++		}
++		failedTxBz := make([][]byte, 0, len(result.Failed))
++		for _, failed := range result.Failed {
++			m.cachedFailedTxs.Add(failed)
++			failedTxBz = append(failedTxBz, failed.GetBytes())
++			m.log.Warnf("%s", failed.Error)
++		}
++		m.DeleteTransaction(failedTxBz...)
++		m.dirtyVersion.Add(1)
++		m.log.Warnf("Removed failed %d txs from mempool; refilling proposal", len(result.Failed))
++		m.FSM.Reset()
+ 	}
+ 	// set the block result block header
+ 	blockResult = &lib.BlockResult{BlockHeader: block.BlockHeader, Transactions: result.Results, Events: result.Events}
+@@ -335,24 +380,6 @@ func (m *Mempool) CheckMempool() (err lib.ErrorI) {
+ 		dirtyVersion:       buildVersion,
+ 		proposalVoteConfig: m.FSM.ProposalVoteConfig(),
+ 	})
+-	// create a cache of failed tx bytes to evict from the mempool
+-	var failedTxBz [][]byte
+-	// mark as failed in the cache
+-	for _, tx := range result.Failed {
+-		// cache failed txs for RPC display
+-		m.cachedFailedTxs.Add(tx)
+-		// save the bytes
+-		failedTxBz = append(failedTxBz, tx.GetBytes())
+-	}
+-	// evict all invalid transactions from the mempool
+-	m.DeleteTransaction(failedTxBz...)
+-	// log a warning
+-	if len(result.Failed) != 0 {
+-		m.log.Warnf("Removed failed %d txs from mempool", len(result.Failed))
+-		for _, f := range result.Failed {
+-			m.log.Warnf("%s", f.Error)
+-		}
+-	}
+ 	// reset the RPC cached results
+ 	m.cachedResults = nil
+ 	// add results to cache
+diff --git a/fsm/automatic.go b/fsm/automatic.go
+index dcf789e8..7acf041c 100644
+--- a/fsm/automatic.go
++++ b/fsm/automatic.go
+@@ -155,6 +155,11 @@ func (s *StateMachine) HandleCertificateResults(qc *lib.QuorumCertificate, commi
+ 	if qc.Results.RewardRecipients == nil {
+ 		return lib.ErrNilRewardRecipients()
+ 	}
++	for _, payment := range qc.Results.RewardRecipients.PaymentPercents {
++		if payment == nil {
++			return lib.ErrInvalidPercentAllocation()
++		}
++	}
+ 	// ensure the committee isn't retired
+ 	retired, err := s.CommitteeIsRetired(qc.Header.ChainId)
+ 	if err != nil {
+@@ -204,15 +209,19 @@ func (s *StateMachine) HandleCertificateResults(qc *lib.QuorumCertificate, commi
+ 		return err
+ 	}
+ 	observeStage("byzantine", byzantineStartTime)
+-	// reduce all payment percents proportional to the non-signer percent
+-	reducePercentsStartTime := time.Now()
+-	for i, p := range results.RewardRecipients.PaymentPercents {
+-		if p == nil {
+-			return lib.ErrInvalidPercentAllocation()
++	// get consensus params
++	consensusParams, err := s.GetParamsCons()
++	if err != nil {
++		return err
++	}
++	// if not reduce all payment percents proportional to the non-signer percent
++	if !consensusParams.PreserveNonSignerRewards {
++		reducePercentsStartTime := time.Now()
++		for _, payment := range results.RewardRecipients.PaymentPercents {
++			payment.Percent = lib.Uint64ReducePercentage(payment.Percent, uint64(nonSignerPercent))
+ 		}
+-		results.RewardRecipients.PaymentPercents[i].Percent = lib.Uint64ReducePercentage(p.Percent, uint64(nonSignerPercent))
++		observeStage("reduce_payment_percents", reducePercentsStartTime)
+ 	}
+-	observeStage("reduce_payment_percents", reducePercentsStartTime)
+ 	// if the quorum is signalling 'retire' for a 'nestedChain'
+ 	if qc.Results.Retired && qc.Header.ChainId != s.Config.ChainId {
+ 		// retire the committeeId on this root
+diff --git a/fsm/automatic_test.go b/fsm/automatic_test.go
+index 1c35ddef..f83ad208 100644
+--- a/fsm/automatic_test.go
++++ b/fsm/automatic_test.go
+@@ -91,7 +91,7 @@ func TestBeginBlock(t *testing.T) {
+ 				require.NoError(t, err)
+ 				// create a copy of the multikey
+ 				mk := committee.MultiKey.Copy()
+-				// only sign with 3/4 to test the non-signer reduction
++				// only sign with 3/4 to exercise non-signer handling
+ 				for i := 0; i < 3; i++ {
+ 					privateKey := newTestKeyGroup(t, i).PrivateKey
+ 					// search for the proper index for the signer
+@@ -209,6 +209,74 @@ func TestHandleCertificateResultsNilGuards(t *testing.T) {
+ 	}
+ }
+ 
++// TestHandleCertificateResultsNonSignerRewardPolicy() verifies configurable reward handling for validators that did not sign.
++func TestHandleCertificateResultsNonSignerRewardPolicy(t *testing.T) {
++	const stakeAmount = uint64(100)
++	keyGroups := newTestKeyGroups(t, 4)
++	validators := make([]*Validator, 0, len(keyGroups))
++	consensusValidators := make([]*lib.ConsensusValidator, 0, len(keyGroups))
++	for _, keyGroup := range keyGroups {
++		validator := &Validator{
++			Address:      keyGroup.Address.Bytes(),
++			PublicKey:    keyGroup.PublicKey.Bytes(),
++			StakedAmount: stakeAmount,
++			Committees:   []uint64{lib.CanopyChainId},
++		}
++		validators = append(validators, validator)
++		consensusValidators = append(consensusValidators, &lib.ConsensusValidator{
++			PublicKey:   validator.PublicKey,
++			VotingPower: validator.StakedAmount,
++		})
++	}
++	committee, err := lib.NewValidatorSet(&lib.ConsensusValidators{ValidatorSet: consensusValidators})
++	require.NoError(t, err)
++
++	for _, test := range []struct {
++		name     string
++		preserve bool
++		expected uint64
++	}{
++		{name: "legacy reduction by default", expected: 75},
++		{name: "governance preserves rewards", preserve: true, expected: 100},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			sm := newTestStateMachine(t)
++			params, err := sm.GetParamsCons()
++			require.NoError(t, err)
++			params.PreserveNonSignerRewards = test.preserve
++			require.NoError(t, sm.SetParamsCons(params))
++			qc := newTestQC(t, testQCParams{
++				height:        1,
++				idxSigned:     map[int]bool{0: true, 1: true, 2: true, 3: false},
++				committeeKeys: keyGroups,
++				committee:     validators,
++				results: &lib.CertificateResult{
++					RewardRecipients: &lib.RewardRecipients{
++						PaymentPercents: []*lib.PaymentPercents{{
++							Address: newTestAddressBytes(t, 4),
++							ChainId: sm.Config.ChainId,
++							Percent: 100,
++						}},
++					},
++				},
++			})
++
++			require.NoError(t, sm.HandleCertificateResults(qc, &committee))
++			require.Equal(t, test.expected, qc.Results.RewardRecipients.PaymentPercents[0].Percent)
++
++			committeeData, err := sm.GetCommitteeData(lib.CanopyChainId)
++			require.NoError(t, err)
++			require.Len(t, committeeData.PaymentPercents, 1)
++			require.Equal(t, test.expected, committeeData.PaymentPercents[0].Percent)
++
++			nonSigners, err := sm.GetNonSigners()
++			require.NoError(t, err)
++			require.Len(t, nonSigners, 1)
++			require.Equal(t, uint64(1), nonSigners[0].Counter)
++		})
++	}
++}
++
+ func TestEndBlock(t *testing.T) {
+ 	// generate committee data for testing
+ 	committeeData := []*lib.CommitteeData{
+diff --git a/fsm/gov.pb.go b/fsm/gov.pb.go
+index f516f4d4..0e41ebe8 100644
+--- a/fsm/gov.pb.go
++++ b/fsm/gov.pb.go
+@@ -241,8 +241,10 @@ type ConsensusParams struct {
+ 	Retired uint64 `protobuf:"varint,4,opt,name=retired,proto3" json:"retired,omitempty"`
+ 	// reset_committee: clears committee data for the provided committee id
+ 	ResetCommittee uint64 `protobuf:"varint,5,opt,name=reset_committee,json=resetCommittee,proto3" json:"resetCommittee"` // @gotags: json:"resetCommittee"
+-	unknownFields  protoimpl.UnknownFields
+-	sizeCache      protoimpl.SizeCache
++	// preserve_non_signer_rewards: when true, missed validator signatures are tracked and penalized without reducing the proposer's allocation.
++	PreserveNonSignerRewards bool `protobuf:"varint,6,opt,name=preserve_non_signer_rewards,json=preserveNonSignerRewards,proto3" json:"preserveNonSignerRewards"` // @gotags: json:"preserveNonSignerRewards"
++	unknownFields            protoimpl.UnknownFields
++	sizeCache                protoimpl.SizeCache
+ }
+ 
+ func (x *ConsensusParams) Reset() {
+@@ -310,6 +312,14 @@ func (x *ConsensusParams) GetResetCommittee() uint64 {
+ 	return 0
+ }
+ 
++// GetPreserveNonSignerRewards() returns whether missed signatures preserve certificate rewards.
++func (x *ConsensusParams) GetPreserveNonSignerRewards() bool {
++	if x != nil {
++		return x.PreserveNonSignerRewards
++	}
++	return false
++}
++
+ // ValidatorParams is the parameter space that defines the rules and criteria for validators in the blockchain
+ type ValidatorParams struct {
+ 	state protoimpl.MessageState `protogen:"open.v1"`
+@@ -784,14 +794,15 @@ const file_gov_proto_rawDesc = "" +
+ 	"Governance\"C\n" +
+ 	"\x0fProtocolVersion\x12\x16\n" +
+ 	"\x06height\x18\x01 \x01(\x04R\x06height\x12\x18\n" +
+-	"\aversion\x18\x02 \x01(\x04R\aversion\"\xc2\x01\n" +
++	"\aversion\x18\x02 \x01(\x04R\aversion\"\x81\x02\n" +
+ 	"\x0fConsensusParams\x12\x1d\n" +
+ 	"\n" +
+ 	"block_size\x18\x01 \x01(\x04R\tblockSize\x12)\n" +
+ 	"\x10protocol_version\x18\x02 \x01(\tR\x0fprotocolVersion\x12\"\n" +
+ 	"\rroot_chain_id\x18\x03 \x01(\x04R\vrootChainId\x12\x18\n" +
+ 	"\aretired\x18\x04 \x01(\x04R\aretired\x12'\n" +
+-	"\x0freset_committee\x18\x05 \x01(\x04R\x0eresetCommittee\"\xa0\b\n" +
++	"\x0freset_committee\x18\x05 \x01(\x04R\x0eresetCommittee\x12=\n" +
++	"\x1bpreserve_non_signer_rewards\x18\x06 \x01(\bR\x18preserveNonSignerRewards\"\xa0\b\n" +
+ 	"\x0fValidatorParams\x12)\n" +
+ 	"\x10unstaking_blocks\x18\x01 \x01(\x04R\x0funstakingBlocks\x12(\n" +
+ 	"\x10max_pause_blocks\x18\x02 \x01(\x04R\x0emaxPauseBlocks\x12?\n" +
+diff --git a/fsm/gov_params.go b/fsm/gov_params.go
+index 2c66926e..423024ac 100644
+--- a/fsm/gov_params.go
++++ b/fsm/gov_params.go
+@@ -40,7 +40,7 @@ type ParamSpace interface {
+ func DefaultParams() *Params {
+ 	return &Params{
+ 		Consensus: &ConsensusParams{
+-			BlockSize:       uint64(units.MB),
++			BlockSize:       uint64(32 * units.MB),
+ 			ProtocolVersion: NewProtocolVersion(0, 1),
+ 			RootChainId:     1,
+ 			Retired:         0,
+@@ -118,6 +118,8 @@ const (
+ 	ParamResetCommittee  = "resetCommittee"  // committee id to reset its committee data
+ )
+ 
++const ParamPreserveNonSignerRewards = "preserveNonSignerRewards" // don't reduce certificate rewards for missed signatures
++
+ var _ ParamSpace = &ConsensusParams{}
+ 
+ // Check() validates the consensus params
+@@ -142,6 +144,11 @@ func (x *ConsensusParams) SetUint64(paramName string, value uint64) lib.ErrorI {
+ 		x.RootChainId = value
+ 	case ParamResetCommittee:
+ 		x.ResetCommittee = value
++	case ParamPreserveNonSignerRewards:
++		if value > 1 {
++			return ErrInvalidParam(ParamPreserveNonSignerRewards)
++		}
++		x.PreserveNonSignerRewards = value == 1
+ 	default:
+ 		return ErrUnknownParam()
+ 	}
+diff --git a/fsm/gov_test.go b/fsm/gov_test.go
+index fdc14a04..0e817a26 100644
+--- a/fsm/gov_test.go
++++ b/fsm/gov_test.go
+@@ -72,6 +72,25 @@ func TestUpdateParam(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:   "consensus non-signer reward policy enabled",
++			detail: "the opt-in reward policy is represented as a boolean governance parameter",
++			update: paramUpdate{
++				space: "cons",
++				name:  ParamPreserveNonSignerRewards,
++				value: &lib.UInt64Wrapper{Value: 1},
++			},
++		},
++		{
++			name:   "consensus non-signer reward policy rejects non-boolean value",
++			detail: "the boolean governance parameter only accepts zero or one",
++			update: paramUpdate{
++				space: "cons",
++				name:  ParamPreserveNonSignerRewards,
++				value: &lib.UInt64Wrapper{Value: 2},
++			},
++			error: "invalid param: preserveNonSignerRewards",
++		},
+ 		{
+ 			name:   "consensus param block size below header rejected",
+ 			detail: "block size must be at least header size to avoid max-size underflow",
+@@ -154,6 +173,9 @@ func TestUpdateParam(t *testing.T) {
+ 				require.Equal(t, uint64Value.Value, got.Validator.MaxCommittees)
+ 			case ParamProtocolVersion: // consensus
+ 				require.Equal(t, stringValue.Value, got.Consensus.ProtocolVersion)
++			case ParamPreserveNonSignerRewards: // consensus
++				require.Equal(t, uint64(1), uint64Value.Value)
++				require.True(t, got.Consensus.PreserveNonSignerRewards)
+ 			case ParamDAORewardPercentage: // gov
+ 				require.Equal(t, uint64Value.Value, got.Governance.DaoRewardPercentage)
+ 			case ParamCertificateResultsFee: // fee
+@@ -165,6 +187,14 @@ func TestUpdateParam(t *testing.T) {
+ 	}
+ }
+ 
++// TestConsensusParamsMissingRewardPolicyDefaultsToLegacy() verifies old parameter payloads retain the legacy reward policy.
++func TestConsensusParamsMissingRewardPolicyDefaultsToLegacy(t *testing.T) {
++	// A pre-upgrade ConsensusParams payload containing only block_size=1.
++	params := new(ConsensusParams)
++	require.NoError(t, proto.Unmarshal([]byte{0x08, 0x01}, params))
++	require.False(t, params.PreserveNonSignerRewards)
++}
++
+ func TestConformStateToParamUpdate(t *testing.T) {
+ 	const amount = uint64(100)
+ 	// preset param sets to test the adjustment after the update
+diff --git a/fsm/state.go b/fsm/state.go
+index aa658a71..1554a81c 100644
+--- a/fsm/state.go
++++ b/fsm/state.go
+@@ -286,21 +286,30 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
+ 	failedCheckTxs := map[int]error{}
+ 	// retain stable multisig intent IDs from the successful precheck pass
+ 	multisigIntentIDs := make([][]byte, len(txs))
++	// Retain decoded transactions and signer identities so execution does not repeat public-key parsing.
++	precheckedTxs := make([]*precheckedTransaction, len(txs))
+ 	// map signature batch indices back to original tx indices
+ 	batchToTxIdx := make([]int, 0, len(txs))
+ 	// first batch validate signatures over the entire set
+ 	checkStartTime := time.Now()
+ 	for i, tx := range txs {
++		if ctx.Err() != nil {
++			return lib.ErrMempoolStopSignal()
++		}
+ 		preCount := batchVerifier.Count()
++		// run inexpensive checks before batching signatures to avoid wasted crypto while preserving execution precheck semantics without state changes.
+ 		checkStore := s.Store().(lib.StoreI)
+ 		checkTxn, e := s.TxnWrap()
+ 		if e != nil {
+ 			return e
+ 		}
+ 		checkResult, checkErr := s.CheckTx(tx, "", batchVerifier)
++		checkTxn.Discard()
++		s.SetStore(checkStore)
+ 		if checkErr != nil {
+ 			failedCheckTxs[i] = checkErr
+ 		} else {
++			precheckedTxs[i] = &precheckedTransaction{transaction: checkResult.tx, sender: checkResult.sender}
+ 			intentID, intentErr := checkResult.tx.GetMultisigIntentID()
+ 			if intentErr != nil {
+ 				failedCheckTxs[i] = intentErr
+@@ -308,8 +317,6 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
+ 				multisigIntentIDs[i] = intentID
+ 			}
+ 		}
+-		checkTxn.Discard()
+-		s.SetStore(checkStore)
+ 		postCount := batchVerifier.Count()
+ 		for j := preCount; j < postCount; j++ {
+ 			batchToTxIdx = append(batchToTxIdx, i)
+@@ -320,6 +327,9 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
+ 		s.Metrics.ApplyTxsCheckTime.Observe(checkDuration.Seconds())
+ 	}
+ 	// execute batch verification of the signatures in the block
++	if ctx.Err() != nil {
++		return lib.ErrMempoolStopSignal()
++	}
+ 	batchVerifyStartTime := time.Now()
+ 	for _, failedIdx := range batchVerifier.Verify() {
+ 		if failedIdx < 0 || failedIdx >= len(batchToTxIdx) {
+@@ -393,7 +403,7 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
+ 		}
+ 		// apply the tx to the state machine, generating a transaction result
+ 		executeStartTime := time.Now()
+-		result, events, e := s.ApplyTransaction(uint64(r.Count), tx, hashString, crypto.NewBatchVerifier(true))
++		result, events, e := s.applyTransaction(uint64(r.Count), tx, hashString, crypto.NewBatchVerifier(true), precheckedTxs[i])
+ 		executeDuration += time.Since(executeStartTime)
+ 		if e != nil {
+ 			// add to the failed list
+diff --git a/fsm/state_test.go b/fsm/state_test.go
+index 8301d739..367b873b 100644
+--- a/fsm/state_test.go
++++ b/fsm/state_test.go
+@@ -165,9 +165,9 @@ func TestApplyBlock(t *testing.T) {
+ 				NumTxs:                1,
+ 				TotalTxs:              1,
+ 				TotalVdfIterations:    0,
+-				Hash:                  []byte{0xcb, 0xd7, 0x7, 0x65, 0xb2, 0x1e, 0x30, 0x96, 0xd8, 0x75, 0x4, 0x54, 0x42, 0xd2, 0x36, 0xee, 0xd4, 0x37, 0x32, 0x5e, 0x0, 0x4a, 0xf9, 0x91, 0x72, 0x3b, 0xa7, 0x51, 0x6, 0x45, 0x70, 0x45},
++				Hash:                  []byte{0xe2, 0x92, 0xf8, 0xb5, 0x91, 0xe5, 0x18, 0xc1, 0x36, 0x55, 0xc6, 0x32, 0x6, 0x2f, 0x9c, 0xfd, 0x17, 0xc5, 0x40, 0xab, 0xc2, 0xa6, 0x1, 0xb8, 0x3c, 0xe1, 0xfb, 0xdc, 0x0, 0x40, 0x8d, 0x8b},
+ 				LastBlockHash:         []byte{0x26, 0x46, 0xe, 0xd3, 0x76, 0x17, 0x95, 0x7c, 0x96, 0xd9, 0xab, 0xf5, 0x94, 0xa1, 0xac, 0x86, 0x5a, 0x43, 0x11, 0x2, 0xfc, 0x38, 0x77, 0x71, 0xa8, 0xc7, 0x6d, 0xa0, 0x2e, 0x6f, 0x1, 0xe8},
+-				StateRoot:             []byte{0xea, 0xe7, 0x38, 0x71, 0xd2, 0x8c, 0x11, 0x5b, 0x96, 0xb5, 0xae, 0xa6, 0x44, 0xd9, 0xac, 0xf8, 0xce, 0x78, 0x21, 0x3, 0x30, 0x7, 0xa2, 0xce, 0xdb, 0x68, 0x7a, 0x74, 0xac, 0xeb, 0xb1, 0x9a},
++				StateRoot:             []byte{0xe1, 0x7f, 0x1c, 0xd5, 0x71, 0x4a, 0x79, 0xe3, 0xc9, 0xfe, 0x98, 0x49, 0x57, 0x26, 0x65, 0x56, 0xcb, 0xb8, 0xbf, 0xda, 0x77, 0xaa, 0xdc, 0xff, 0xb9, 0xd7, 0x16, 0x5d, 0xfb, 0x53, 0x96, 0xea},
+ 				TransactionRoot:       []byte{0x7f, 0x1, 0x75, 0x98, 0x49, 0x5, 0x73, 0x43, 0xb7, 0xb7, 0xea, 0x6c, 0x55, 0x84, 0x91, 0xe7, 0x7d, 0x51, 0xf4, 0x8a, 0x3, 0x3a, 0xe6, 0x9e, 0x4, 0x6, 0x58, 0x8a, 0xfb, 0x63, 0xde, 0x25},
+ 				ValidatorRoot:         []byte{0x24, 0xa5, 0xf1, 0x5d, 0xdd, 0x13, 0xdd, 0x75, 0x33, 0x2a, 0xe4, 0xf6, 0x2b, 0x3f, 0xa, 0x8c, 0xdf, 0x90, 0x1d, 0x9f, 0xaa, 0xb0, 0x5d, 0xae, 0x7a, 0x47, 0xa7, 0x59, 0x98, 0x64, 0xb3, 0x7c},
+ 				NextValidatorRoot:     []byte{0x24, 0xa5, 0xf1, 0x5d, 0xdd, 0x13, 0xdd, 0x75, 0x33, 0x2a, 0xe4, 0xf6, 0x2b, 0x3f, 0xa, 0x8c, 0xdf, 0x90, 0x1d, 0x9f, 0xaa, 0xb0, 0x5d, 0xae, 0x7a, 0x47, 0xa7, 0x59, 0x98, 0x64, 0xb3, 0x7c},
+@@ -350,6 +350,31 @@ func TestApplyTransactions_DoesNotReturnCheckErrors(t *testing.T) {
+ 	require.ErrorContains(t, results.Failed[0].Error, "invalid tx height")
+ }
+ 
++// TestApplyTransactionsRejectsWrongNetworkBeforeSignatureBatch() verifies network mismatches fail before signature batching.
++func TestApplyTransactionsRejectsWrongNetworkBeforeSignatureBatch(t *testing.T) {
++	sm := newTestStateMachine(t)
++	kg := newTestKeyGroup(t)
++	tx, err := NewSendTransaction(
++		kg.PrivateKey,
++		newTestAddress(t),
++		1,
++		uint64(sm.NetworkID)+1,
++		sm.Config.ChainId,
++		DefaultParams().Fee.SendFee,
++		sm.Height(),
++		"",
++	)
++	require.NoError(t, err)
++	tx.(*lib.Transaction).Signature.Signature = make([]byte, crypto.BLS12381SignatureSize)
++	txBytes, err := lib.Marshal(tx)
++	require.NoError(t, err)
++
++	results := new(lib.ApplyBlockResults)
++	require.NoError(t, sm.ApplyTransactions(context.Background(), [][]byte{txBytes}, results, true))
++	require.Len(t, results.Failed, 1)
++	require.ErrorContains(t, results.Failed[0].Error, "wrong network id")
++}
++
+ func TestApplyTransactions_BatchSignatureIndexMapping(t *testing.T) {
+ 	sm := newTestStateMachine(t)
+ 	kg := newTestKeyGroup(t)
+diff --git a/fsm/transaction.go b/fsm/transaction.go
+index 840ca1cf..77252b4d 100644
+--- a/fsm/transaction.go
++++ b/fsm/transaction.go
+@@ -17,11 +17,29 @@ const BlockAcceptanceRange = 4320
+ 
+ // ApplyTransaction() processes the transaction within the state machine, returning the corresponding TxResult.
+ func (s *StateMachine) ApplyTransaction(index uint64, transaction []byte, txHash string, batchVerifier *crypto.BatchVerifier) (*lib.TxResult, []*lib.Event, lib.ErrorI) {
++	return s.applyTransaction(index, transaction, txHash, batchVerifier, nil)
++}
++
++type precheckedTransaction struct {
++	transaction *lib.Transaction
++	sender      crypto.AddressI
++}
++
++// applyTransaction() executes one prechecked transaction and returns its result and emitted events.
++func (s *StateMachine) applyTransaction(index uint64, transaction []byte, txHash string, batchVerifier *crypto.BatchVerifier, prechecked *precheckedTransaction) (*lib.TxResult, []*lib.Event, lib.ErrorI) {
+ 	applyTransactionStartTime := time.Now()
+ 	s.events.Refer(txHash)
+ 	// validate the transaction and get the check result
+ 	checkTxStartTime := time.Now()
+-	result, err := s.CheckTx(transaction, txHash, batchVerifier)
++	var (
++		result *CheckTxResult
++		err    lib.ErrorI
++	)
++	if prechecked == nil {
++		result, err = s.CheckTx(transaction, txHash, batchVerifier)
++	} else {
++		result, err = s.checkTx(prechecked.transaction, txHash, batchVerifier, prechecked.sender)
++	}
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+@@ -108,13 +126,6 @@ func (s *StateMachine) ApplyTransaction(index uint64, transaction []byte, txHash
+ 
+ // CheckTx() validates the transaction object
+ func (s *StateMachine) CheckTx(transaction []byte, txHash string, batchVerifier *crypto.BatchVerifier) (result *CheckTxResult, err lib.ErrorI) {
+-	// create various result variables
+-	var (
+-		authorizedSigners [][]byte
+-		msg               lib.MessageI
+-		recipient         []byte
+-		plugin            bool
+-	)
+ 	tx := new(lib.Transaction)
+ 	// populate the object ref with the bytes of the transaction
+ 	decodeStartTime := time.Now()
+@@ -128,6 +139,18 @@ func (s *StateMachine) CheckTx(transaction []byte, txHash string, batchVerifier
+ 	if s.Metrics != nil {
+ 		s.Metrics.CheckTxDecodeTime.Observe(time.Since(decodeStartTime).Seconds())
+ 	}
++	return s.checkTx(tx, txHash, batchVerifier, nil)
++}
++
++// checkTx() validates transaction replay, message, fee, authorization, and signature requirements.
++func (s *StateMachine) checkTx(tx *lib.Transaction, txHash string, batchVerifier *crypto.BatchVerifier, precheckedSender crypto.AddressI) (result *CheckTxResult, err lib.ErrorI) {
++	// create various result variables
++	var (
++		authorizedSigners [][]byte
++		msg               lib.MessageI
++		recipient         []byte
++		plugin            bool
++	)
+ 	// validate the timestamp (prune friendly - replay protection)
+ 	replayStartTime := time.Now()
+ 	if err = s.CheckReplay(tx, txHash); err != nil {
+@@ -179,9 +202,14 @@ func (s *StateMachine) CheckTx(transaction []byte, txHash string, batchVerifier
+ 	}
+ 	// validate the signature of the transaction
+ 	signatureStartTime := time.Now()
+-	sender, err := s.CheckSignature(tx, authorizedSigners, batchVerifier)
+-	if err != nil {
+-		return
++	sender := precheckedSender
++	if sender == nil {
++		sender, err = s.CheckSignature(tx, authorizedSigners, batchVerifier)
++		if err != nil {
++			return
++		}
++	} else if err = authorizeSender(sender, authorizedSigners); err != nil {
++		return nil, err
+ 	}
+ 	var restrictedAddress []byte
+ 	switch {
+@@ -223,6 +251,16 @@ func (s *StateMachine) CheckTx(transaction []byte, txHash string, batchVerifier
+ 	}, nil
+ }
+ 
++// authorizeSender() verifies that the sender appears in the message's authorized signer set.
++func authorizeSender(sender crypto.AddressI, authorizedSigners [][]byte) lib.ErrorI {
++	for _, authorized := range authorizedSigners {
++		if sender.Equals(crypto.NewAddressFromBytes(authorized)) {
++			return nil
++		}
++	}
++	return ErrUnauthorizedTx()
++}
++
+ // CheckTxResult is the result object from CheckTx()
+ type CheckTxResult struct {
+ 	tx        *lib.Transaction // the transaction object
+@@ -234,6 +272,18 @@ type CheckTxResult struct {
+ 
+ // CheckSignature() validates the signer and the digital signature associated with the transaction object
+ func (s *StateMachine) CheckSignature(tx *lib.Transaction, authorizedSigners [][]byte, batchSigVerifier *crypto.BatchVerifier) (crypto.AddressI, lib.ErrorI) {
++	address, err := s.checkSignatureEnvelope(tx, batchSigVerifier)
++	if err != nil {
++		return nil, err
++	}
++	if err = authorizeSender(address, authorizedSigners); err != nil {
++		return nil, err
++	}
++	return address, nil
++}
++
++// checkSignatureEnvelope() validates a signature and returns its address without message-specific authorization for the later execution pass.
++func (s *StateMachine) checkSignatureEnvelope(tx *lib.Transaction, batchSigVerifier *crypto.BatchVerifier) (crypto.AddressI, lib.ErrorI) {
+ 	// validate the actual signature bytes
+ 	if tx.Signature == nil || len(tx.Signature.Signature) == 0 {
+ 		return nil, ErrEmptySignature()
+@@ -278,17 +328,7 @@ func (s *StateMachine) CheckSignature(tx *lib.Transaction, authorizedSigners [][
+ 		}
+ 	}
+ 	// calculate the corresponding address from the public key
+-	address := publicKey.Address()
+-	// for each authorized signer
+-	for _, authorized := range authorizedSigners {
+-		// if the address that signed the transaction matches one of the authorized signers
+-		if address.Equals(crypto.NewAddressFromBytes(authorized)) {
+-			// return the signer address
+-			return address, nil
+-		}
+-	}
+-	// if no authorized signer matched the signer address, it's unauthorized
+-	return nil, ErrUnauthorizedTx()
++	return publicKey.Address(), nil
+ }
+ 
+ // CheckReplay() validates the timestamp of the transaction
+diff --git a/lib/.proto/gov.proto b/lib/.proto/gov.proto
+index 4c2e1f60..9f122e7a 100644
+--- a/lib/.proto/gov.proto
++++ b/lib/.proto/gov.proto
+@@ -71,6 +71,8 @@ message ConsensusParams {
+   uint64 retired = 4;
+   // reset_committee: clears committee data for the provided committee id
+   uint64 reset_committee = 5; // @gotags: json:"resetCommittee"
++  // preserve_non_signer_rewards: when true, missed validator signatures are tracked and penalized without reducing the proposer's allocation
++  bool preserve_non_signer_rewards = 6; // @gotags: json:"preserveNonSignerRewards"
+ }
+ 
+ // ValidatorParams is the parameter space that defines the rules and criteria for validators in the blockchain
+diff --git a/lib/config.go b/lib/config.go
+index c3cc9345..bb38e52b 100644
+--- a/lib/config.go
++++ b/lib/config.go
+@@ -8,6 +8,7 @@ import (
+ 	"path"
+ 	"path/filepath"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/alecthomas/units"
+ )
+@@ -99,7 +100,7 @@ func DefaultMainConfig() MainConfig {
+ 				Url:     "http://localhost:50002", // RooChainURL points to self
+ 			},
+ 		},
+-		RunVDF:          true,          // run the VDF by default
++		RunVDF:          false,         // checkpoints replace the VDF on the fast chain
+ 		ChainId:         CanopyChainId, // default chain url is 1
+ 		Headless:        false,         // serve the web wallet and block explorer by default
+ 		AutoUpdate:      true,          // set it as default while in inmature state
+@@ -214,20 +215,73 @@ type ConsensusConfig struct {
+ 	PrecommitVoteTimeoutMS  int `json:"precommitVoteTimeoutMS"`  // minus QC validation + vote time, is how long (in milliseconds) the replica sleeps before moving to COMMIT phase
+ 	CommitTimeoutMS         int `json:"commitTimeoutMS"`         // minus Precommit-QC aggregation time (if Leader), how long (in milliseconds) the replica sleeps before moving to the COMMIT-PROCESS phase
+ 	RoundInterruptTimeoutMS int `json:"roundInterruptTimeoutMS"` // minus gossiping current Round time, how long (in milliseconds) the replica sleeps before moving to PACEMAKER phase
++
++	ProposerMode              string `json:"proposerMode"`              // proposer-selection protocol: "vrf" (legacy) or "stakeWeightedRoundRobin" (fast)
++	RoundRobinBlockIntervalMS int    `json:"roundRobinBlockIntervalMS"` // round-zero pacing target used only by stakeWeightedRoundRobin
++	BlockConsensusLeadTimeMS  int    `json:"blockConsensusLeadTimeMS"`  // minimum proposal-to-timestamp budget used by stakeWeightedRoundRobin
++	MaximumFutureBlockTimeMS  int    `json:"maximumFutureBlockTimeMS"`  // maximum accepted future timestamp; coordinate across stakeWeightedRoundRobin validators
+ }
+ 
++const (
++	defaultRoundRobinBlockIntervalMS = 500
++	defaultBlockConsensusLeadTimeMS  = 175
++	defaultMaximumFutureBlockTimeMS  = 1000
++)
++
+ // DefaultConsensusConfig() configures the block time
+ func DefaultConsensusConfig() ConsensusConfig {
+ 	return ConsensusConfig{
+-		NewHeightTimeoutMs:     4500, // 4.5 seconds
+-		ElectionTimeoutMS:      1500, // 1.5 seconds
+-		ElectionVoteTimeoutMS:  1500, // 1.5 seconds
+-		ProposeTimeoutMS:       2500, // 2.5 seconds
+-		ProposeVoteTimeoutMS:   4000, // 4 seconds
+-		PrecommitTimeoutMS:     2000, // 2 seconds
+-		PrecommitVoteTimeoutMS: 2000, // 2 seconds
+-		CommitTimeoutMS:        2000, // 2 seconds
++		NewHeightTimeoutMs:     500,
++		ElectionTimeoutMS:      100, // deterministic leader selection is local
++		ElectionVoteTimeoutMS:  500, // collect new-view votes / wait for proposal
++		ProposeTimeoutMS:       500, // proposal propagation failure detector
++		ProposeVoteTimeoutMS:   500, // proposal vote failure detector
++		PrecommitTimeoutMS:     500, // precommit propagation failure detector
++		PrecommitVoteTimeoutMS: 500, // precommit vote failure detector
++		CommitTimeoutMS:        500, // commit propagation failure detector
++
++		ProposerMode:              ProposerModeVRF,
++		RoundRobinBlockIntervalMS: defaultRoundRobinBlockIntervalMS,
++		BlockConsensusLeadTimeMS:  defaultBlockConsensusLeadTimeMS,
++		MaximumFutureBlockTimeMS:  defaultMaximumFutureBlockTimeMS,
++		RoundInterruptTimeoutMS:   250, // collect pacemaker votes before the next round
++	}
++}
++
++const (
++	// ProposerModeVRF preserves the original election protocol as the default for configs without proposerMode.
++	ProposerModeVRF = "vrf"
++	// ProposerModeStakeWeightedRoundRobin enables the deterministic leader schedule and configurable optimistic pacemaker.
++	ProposerModeStakeWeightedRoundRobin = "stakeWeightedRoundRobin"
++)
++
++// UsesDeterministicProposers() reports whether this node uses the fast proposer protocol, which must match across validators.
++func (c *ConsensusConfig) UsesDeterministicProposers() bool {
++	return c != nil && c.ProposerMode == ProposerModeStakeWeightedRoundRobin
++}
++
++// RoundRobinBlockInterval() returns the coordinated round-zero pacing target, defaulting to 500 ms for old or zero-value configs.
++func (c *ConsensusConfig) RoundRobinBlockInterval() time.Duration {
++	if c == nil || c.RoundRobinBlockIntervalMS <= 0 {
++		return defaultRoundRobinBlockIntervalMS * time.Millisecond
++	}
++	return time.Duration(c.RoundRobinBlockIntervalMS) * time.Millisecond
++}
++
++// BlockConsensusLeadTime returns the minimum proposal-to-timestamp budget used by stake-weighted round-robin.
++func (c *ConsensusConfig) BlockConsensusLeadTime() time.Duration {
++	if c == nil || c.BlockConsensusLeadTimeMS <= 0 {
++		return defaultBlockConsensusLeadTimeMS * time.Millisecond
++	}
++	return time.Duration(c.BlockConsensusLeadTimeMS) * time.Millisecond
++}
++
++// MaximumFutureBlockTime returns the maximum accepted future timestamp used by stake-weighted round-robin.
++func (c *ConsensusConfig) MaximumFutureBlockTime() time.Duration {
++	if c == nil || c.MaximumFutureBlockTimeMS <= 0 {
++		return defaultMaximumFutureBlockTimeMS * time.Millisecond
+ 	}
++	return time.Duration(c.MaximumFutureBlockTimeMS) * time.Millisecond
+ }
+ 
+ // BlockTimeMS() returns the expected block time in milliseconds
+@@ -335,8 +389,8 @@ type MempoolConfig struct {
+ // DefaultMempoolConfig() returns the developer created Mempool options
+ func DefaultMempoolConfig() MempoolConfig {
+ 	return MempoolConfig{
+-		MaxTotalBytes:              uint64(10 * units.MB),      // 10 MB max size
+-		MaxTransactionCount:        5000,                       // 5000 max transactions
++		MaxTotalBytes:              uint64(64 * units.MB),      // buffer many full 500 ms blocks
++		MaxTransactionCount:        250000,                     // roughly 25 seconds at 10K TPS
+ 		IndividualMaxTxSize:        uint32(4 * units.Kilobyte), // 4 KB max individual tx size
+ 		DropPercentage:             35,                         // drop 35% if limits are reached
+ 		LazyMempoolCheckFrequencyS: 2,                          // check every 2 seconds
+diff --git a/lib/config_test.go b/lib/config_test.go
+index e92224c7..91286076 100644
+--- a/lib/config_test.go
++++ b/lib/config_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"os"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+@@ -30,6 +31,26 @@ func TestDefaultConfig(t *testing.T) {
+ 	require.Empty(t, diff, "config mismatch: %s", diff)
+ }
+ 
++// TestConfigDefaults() verifies the consensus defaults used when optional configuration is absent.
++func TestConfigDefaults(t *testing.T) {
++	config := DefaultConfig()
++	require.Equal(t, uint64(80_000_000), config.InitialTokensPerBlock)
++	require.Equal(t, uint64(3_150_000), config.BlocksPerHalvening)
++	require.Equal(t, 500, config.NewHeightTimeoutMs)
++	require.Equal(t, 500*time.Millisecond, config.ConsensusConfig.RoundRobinBlockInterval())
++	require.Equal(t, 175*time.Millisecond, config.ConsensusConfig.BlockConsensusLeadTime())
++	require.Equal(t, time.Second, config.ConsensusConfig.MaximumFutureBlockTime())
++	require.Equal(t, uint64(64_000_000), config.MaxTotalBytes)
++	require.Equal(t, uint32(250_000), config.MaxTransactionCount)
++
++	config.RoundRobinBlockIntervalMS = 750
++	config.BlockConsensusLeadTimeMS = 225
++	config.MaximumFutureBlockTimeMS = 1500
++	require.Equal(t, 750*time.Millisecond, config.ConsensusConfig.RoundRobinBlockInterval())
++	require.Equal(t, 225*time.Millisecond, config.ConsensusConfig.BlockConsensusLeadTime())
++	require.Equal(t, 1500*time.Millisecond, config.ConsensusConfig.MaximumFutureBlockTime())
++}
++
+ func TestFileConfig(t *testing.T) {
+ 	filePath := "./test_config"
+ 	// define a variable to test upon
+@@ -44,6 +65,19 @@ func TestFileConfig(t *testing.T) {
+ 	require.Equal(t, config, got)
+ }
+ 
++// TestFileConfigWithoutProposerModeDefaultsToVRF() verifies old config files retain VRF proposer selection.
++func TestFileConfigWithoutProposerModeDefaultsToVRF(t *testing.T) {
++	filePath := t.TempDir() + "/config.json"
++	require.NoError(t, os.WriteFile(filePath, []byte(`{"chainId":1}`), 0o600))
++
++	config, err := NewConfigFromFile(filePath)
++	require.NoError(t, err)
++	require.Equal(t, ProposerModeVRF, config.ProposerMode)
++	require.Equal(t, 500*time.Millisecond, config.ConsensusConfig.RoundRobinBlockInterval())
++	require.Equal(t, 175*time.Millisecond, config.ConsensusConfig.BlockConsensusLeadTime())
++	require.Equal(t, time.Second, config.ConsensusConfig.MaximumFutureBlockTime())
++}
++
+ func TestRestrictedAddressesOmitEmpty(t *testing.T) {
+ 	bz, err := json.Marshal(DefaultConfig())
+ 	require.NoError(t, err)
+diff --git a/lib/crypto/aead.go b/lib/crypto/aead.go
+index f85384e0..db6b41fa 100644
+--- a/lib/crypto/aead.go
++++ b/lib/crypto/aead.go
+@@ -8,9 +8,10 @@ import (
+ 	"io"
+ )
+ 
++// MaxDataSize is the largest plaintext in one variable-length authenticated transport record.
+ const (
+ 	LengthHeaderSize   = 4
+-	MaxDataSize        = 1024
++	MaxDataSize        = 64 * 1024
+ 	ChallengeSize      = 32
+ 	Poly1305TagSize    = 16
+ 	FrameSize          = MaxDataSize + LengthHeaderSize
+@@ -21,6 +22,13 @@ const (
+ 	HKDFSize           = TwoAEADKeySize + ChallengeSize // 2 keys and challenge
+ )
+ 
++const (
++	// LegacyMaxDataSize is the fixed plaintext payload used by transport V1.
++	LegacyMaxDataSize        = 1024
++	LegacyFrameSize          = LegacyMaxDataSize + LengthHeaderSize
++	LegacyEncryptedFrameSize = Poly1305TagSize + LegacyFrameSize
++)
++
+ // Big picture: DH is used to establish a shared secret, and then HKDF is used to derive multiple keys from that secret for encryption
+ 
+ // HKDFSecretsAndChallenge generates shared encryption keys and a unique challenge
+diff --git a/lib/error.go b/lib/error.go
+index 770e63ef..a4a05904 100644
+--- a/lib/error.go
++++ b/lib/error.go
+@@ -93,6 +93,8 @@ const (
+ 	CodeInvalidResultsHash          ErrorCode = 30
+ 	CodeNonNilBlock                 ErrorCode = 31
+ 	CodeProtoParse                  ErrorCode = 32
++	CodeFutureBlockTime             ErrorCode = 33
++	CodeNonMonotonicBlockTime       ErrorCode = 34
+ 
+ 	// Consensus Module
+ 	ConsensusModule ErrorModule = "consensus"
+@@ -421,6 +423,16 @@ func ErrNilBlockTime() ErrorI {
+ 	return NewError(CodeNilBlockTime, MainModule, "nil block time")
+ }
+ 
++// ErrFutureBlockTime() reports a block timestamp beyond the permitted future bound.
++func ErrFutureBlockTime(got, maximum uint64) ErrorI {
++	return NewError(CodeFutureBlockTime, MainModule, fmt.Sprintf("block time too far in future: got=%d maximum=%d", got, maximum))
++}
++
++// ErrNonMonotonicBlockTime() reports a block timestamp that does not advance chain time.
++func ErrNonMonotonicBlockTime(got, previous uint64) ErrorI {
++	return NewError(CodeNonMonotonicBlockTime, MainModule, fmt.Sprintf("block time must increase: got=%d previous=%d", got, previous))
++}
++
+ func ErrWrongLengthLastBlockHash() ErrorI {
+ 	return NewError(CodeWrongLengthLastBlockHash, MainModule, "wrong length last block hash")
+ }
+diff --git a/lib/mempool.go b/lib/mempool.go
+index 06b909c1..c55ce9bb 100644
+--- a/lib/mempool.go
++++ b/lib/mempool.go
+@@ -42,6 +42,8 @@ type FeeMempool struct {
+ type MempoolTx struct {
+ 	Tx  []byte // transaction bytes
+ 	Fee uint64 // fee associated with the transaction
++
++	hash string // cached transaction hash used by the mempool index
+ }
+ 
+ // NewMempool() creates a new FeeMempool instance of a Mempool
+@@ -98,7 +100,7 @@ func (f *FeeMempool) AddTransactions(txs ...[]byte) (recheck bool, err ErrorI) {
+ 			fee = math.MaxUint32
+ 		}
+ 		// add to the list
+-		mempoolTxs = append(mempoolTxs, MempoolTx{Tx: tx, Fee: fee})
++		mempoolTxs = append(mempoolTxs, MempoolTx{Tx: tx, Fee: fee, hash: hash})
+ 		// update the number of bytes
+ 		txsBytes += txBytes
+ 	}
+@@ -133,15 +135,15 @@ func (f *FeeMempool) GetTransactions(maxBytes uint64) (txs [][]byte) {
+ 	// for each transaction in the pool
+ 	for _, tx := range f.pool.s {
+ 		// get the size of the transaction in bytes
+-		txSize := len(tx.Tx)
+-		// add to the total bytes
+-		totalBytes += uint64(txSize)
++		txSize := uint64(len(tx.Tx))
+ 		// check to see if the addition of this transaction
+ 		// exceeds the maxBytes limit
+-		if totalBytes > maxBytes {
+-			// exit without adding the tx
+-			return
++		if txSize > maxBytes-totalBytes {
++			// Keep scanning so one oversized high-fee transaction cannot hide smaller valid entries.
++			continue
+ 		}
++		// add to the total bytes
++		totalBytes += txSize
+ 		// add the tx to the list and increment totalTxs
+ 		txs = append(txs, tx.Tx)
+ 	}
+@@ -229,29 +231,37 @@ type MempoolTxs struct {
+ 
+ // insert() batch inserts a number of txs into the list sorted by the highest fee to the lowest fee
+ func (t *MempoolTxs) insert(txs ...MempoolTx) {
+-	// combine existing and incoming txs
+-	combined := append(t.s, txs...)
+-	// sort by fee descending while preserving arrival order among equal-fee transactions
+-	sort.SliceStable(combined, func(i, j int) bool {
+-		return combined[i].Fee > combined[j].Fee
+-	})
+-	// prepare new map and slice
+-	newMap := make(map[string]struct{}, len(combined))
+-	newList := make([]MempoolTx, 0, len(combined))
+-	// for each tx in the combined array
+-	for _, tx := range combined {
+-		hash := crypto.HashString(tx.Tx)
+-		// skip duplicates
+-		if _, exists := newMap[hash]; exists {
+-			continue
++	if len(txs) == 0 {
++		return
++	}
++	if t.m == nil {
++		t.m = make(map[string]struct{}, len(txs))
++	}
++	// AddTransactions supplies a de-duplicated batch with cached hashes.
++	sort.SliceStable(txs, func(i, j int) bool { return txs[i].Fee > txs[j].Fee })
++	for _, tx := range txs {
++		t.m[tx.hash] = struct{}{}
++	}
++	// Append the common equal-fee batch without scanning the existing backlog.
++	if len(t.s) == 0 || t.s[len(t.s)-1].Fee >= txs[0].Fee {
++		t.s = append(t.s, txs...)
++		return
++	}
++	// Merge the fee-sorted lists with existing entries winning ties to preserve arrival order.
++	merged := make([]MempoolTx, 0, len(t.s)+len(txs))
++	i, j := 0, 0
++	for i < len(t.s) && j < len(txs) {
++		if t.s[i].Fee >= txs[j].Fee {
++			merged = append(merged, t.s[i])
++			i++
++		} else {
++			merged = append(merged, txs[j])
++			j++
+ 		}
+-		// populate the newMap and newList
+-		newList = append(newList, tx)
+-		newMap[hash] = struct{}{}
+ 	}
+-	// update
+-	t.s = newList
+-	t.m = newMap
++	merged = append(merged, t.s[i:]...)
++	merged = append(merged, txs[j:]...)
++	t.s = merged
+ }
+ 
+ // delete() batch deletes a number of transactions
+@@ -269,8 +279,11 @@ func (t *MempoolTxs) delete(txs [][]byte) (deleted []MempoolTx, deletedBz int) {
+ 	newMap := make(map[string]struct{}, len(t.s))
+ 	// for each tx in the current slice
+ 	for _, tx := range t.s {
+-		// create the hash
+-		hash := crypto.HashString(tx.Tx)
++		hash := tx.hash
++		if hash == "" {
++			hash = crypto.HashString(tx.Tx)
++			tx.hash = hash
++		}
+ 		// if should delete
+ 		if _, found := toDelete[hash]; found {
+ 			// add to deleted list
+@@ -303,10 +316,12 @@ func (t *MempoolTxs) drop(percent int) (dropped []MempoolTx) {
+ 	dropped = t.s[len(t.s)-numDrop:]
+ 	// update the list with what's not evicted
+ 	t.s = t.s[:len(t.s)-numDrop]
+-	// rebuild map
+-	t.m = make(map[string]struct{}, len(t.s))
+-	for _, tx := range t.s {
+-		t.m[crypto.HashString(tx.Tx)] = struct{}{}
++	// Remove only the evicted hashes; retained entries stay indexed.
++	for i := range dropped {
++		if dropped[i].hash == "" {
++			dropped[i].hash = crypto.HashString(dropped[i].Tx)
++		}
++		delete(t.m, dropped[i].hash)
+ 	}
+ 	// exit
+ 	return
+diff --git a/lib/mempool_test.go b/lib/mempool_test.go
+index 6d0d23fa..37a72533 100644
+--- a/lib/mempool_test.go
++++ b/lib/mempool_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"github.com/canopy-network/canopy/lib/crypto"
+ 	"github.com/stretchr/testify/require"
+ 	"math"
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -297,6 +298,10 @@ func TestGetAndContainsTransaction(t *testing.T) {
+ 	// marshal to bytes
+ 	transactionD, err := Marshal(tx)
+ 	require.NoError(t, err)
++	tx = &Transaction{MessageType: testMessageName, Msg: a, Signature: sig, CreatedHeight: 1,
++		Time: uint64(time.Now().UnixMicro()), Fee: 2000, Memo: strings.Repeat("x", 100), NetworkId: 1, ChainId: 1}
++	transactionTooLarge, err := Marshal(tx)
++	require.NoError(t, err)
+ 	// define test cases
+ 	tests := []struct {
+ 		name          string
+@@ -356,6 +361,25 @@ func TestGetAndContainsTransaction(t *testing.T) {
+ 			},
+ 			maxBytes: uint64(len(transactionA) + len(transactionB)),
+ 		},
++		{
++			name:   "skip a high fee transaction that does not fit",
++			detail: "a large transaction must not hide smaller transactions later in fee order",
++			txs: [][]byte{
++				transactionTooLarge,
++				transactionD,
++			},
++			mempool: &FeeMempool{
++				config: MempoolConfig{
++					MaxTotalBytes:       math.MaxUint64,
++					MaxTransactionCount: math.MaxUint32,
++					IndividualMaxTxSize: math.MaxUint32,
++					DropPercentage:      30,
++				},
++			},
++			expectedCount: 1,
++			expectedTxs:   [][]byte{transactionD},
++			maxBytes:      uint64(len(transactionD)),
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+diff --git a/p2p/conn.go b/p2p/conn.go
+index e92f3d98..007a761f 100644
+--- a/p2p/conn.go
++++ b/p2p/conn.go
+@@ -78,6 +78,7 @@ type MultiConn struct {
+ 	lastPingRecv  atomic.Int64                        // last time we received a ping (unix nano)
+ 	lastPongSent  atomic.Int64                        // last time we queued a pong (unix nano)
+ 	peerInfo      *lib.PeerInfo                       // peer info cache
++	transportV2   bool                                // immutable wire format selected during handshake
+ }
+ 
+ // NewConnection() creates and starts a new instance of a MultiConn
+@@ -103,6 +104,11 @@ func (p *P2P) NewConnection(conn net.Conn, info *lib.PeerInfo) (*MultiConn, lib.
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// Reject a handshake that straddles the hard cutover so the caller reconnects using the current mode.
++	if eConn.TransportV2() != transportV2ActiveAt(time.Now()) {
++		_ = eConn.Close()
++		return nil, ErrTransportCutover()
++	}
+ 	c := &MultiConn{
+ 		conn:          eConn,
+ 		uuid:          rand.Uint64(),
+@@ -116,6 +122,7 @@ func (p *P2P) NewConnection(conn net.Conn, info *lib.PeerInfo) (*MultiConn, lib.
+ 		close:         sync.Once{},
+ 		log:           p.log,
+ 		peerInfo:      info,
++		transportV2:   eConn.TransportV2(),
+ 	}
+ 	now := time.Now().UnixNano()
+ 	c.lastPong.Store(now)
+@@ -158,6 +165,10 @@ func (c *MultiConn) Stop() {
+ func (c *MultiConn) Send(topic lib.Topic, bz []byte) (ok bool) {
+ 	defer lib.TimeTrack(c.log, time.Now(), time.Second)
+ 	startTime := time.Now()
++	if uint64(len(bz)) > uint64(maxMessageSize) {
++		c.log.Errorf("Message for stream %s exceeds max size: %d", topic, len(bz))
++		return false
++	}
+ 	stream, ok := c.streams[topic]
+ 	if !ok {
+ 		c.log.Errorf("Stream %s does not exist", topic)
+diff --git a/p2p/encrypt.go b/p2p/encrypt.go
+index 38d65c70..73b6abda 100644
+--- a/p2p/encrypt.go
++++ b/p2p/encrypt.go
+@@ -34,13 +34,27 @@ var (
+ 	handshakeTimeout = 1 * time.Second
+ )
+ 
++// TransportV2ActivationUnix is the network-wide hard cutover time; zero keeps V2 disabled to prevent accidental peer partitioning.
++const TransportV2ActivationUnix int64 = 0
++
++// transportV2ActiveAt() reports whether transport V2 is active at the supplied time.
++func transportV2ActiveAt(now time.Time) bool {
++	return transportV2ActiveAtUnix(now, TransportV2ActivationUnix)
++}
++
++// transportV2ActiveAtUnix() reports whether the supplied activation timestamp has been reached.
++func transportV2ActiveAtUnix(now time.Time, activationUnix int64) bool {
++	return activationUnix != 0 && now.Unix() >= activationUnix
++}
++
+ // EncryptedConn is made of the underlying tcp connection, send and receive AEAD ciphers, and the peer address
+ // NOTE: receiving and sending have two distinct AEAD state objects for key / nonce management and simultaneous send/receive
+ type EncryptedConn struct {
+-	conn    net.Conn   // underlying connection
+-	receive aeadState  // encryption state for receiving messages
+-	send    aeadState  // encryption state for sending messages
+-	mu      sync.Mutex // mutex to prevent unsafe use of net conn
++	conn        net.Conn   // underlying connection
++	receive     aeadState  // encryption state for receiving messages
++	send        aeadState  // encryption state for sending messages
++	mu          sync.Mutex // mutex to prevent unsafe use of net conn
++	transportV2 bool       // fixed for the lifetime of this connection
+ 
+ 	Address *lib.PeerAddress // authenticated remote peer information
+ }
+@@ -55,10 +69,15 @@ type aeadState struct {
+ 
+ // NewHandshake() executes the authentication protocol between two tcp connections to result in an encryption connection
+ func NewHandshake(conn net.Conn, meta *lib.PeerMeta, privateKey crypto.PrivateKeyI) (encryptedConn *EncryptedConn, e lib.ErrorI) {
++	return newHandshake(conn, meta, privateKey, transportV2ActiveAt(time.Now()))
++}
++
++// newHandshake() authenticates a peer and establishes an encrypted connection using the selected transport version.
++func newHandshake(conn net.Conn, meta *lib.PeerMeta, privateKey crypto.PrivateKeyI, transportV2 bool) (encryptedConn *EncryptedConn, e lib.ErrorI) {
+ 	// create a temporary keypair to establish a shared secret
+ 	tempPrivateKey, _ := crypto.NewEd25519PrivateKey()
+ 	tempPublicKey := tempPrivateKey.PublicKey().Bytes()
+-	encryptedConn = &EncryptedConn{conn: conn}
++	encryptedConn = &EncryptedConn{conn: conn, transportV2: transportV2}
+ 	// swap temporary keys
+ 	peerTempPublicKey, e := keySwap(encryptedConn, tempPublicKey, handshakeTimeout)
+ 	if e != nil {
+@@ -133,42 +152,58 @@ func (c *EncryptedConn) Write(data []byte) (n int, err error) {
+ 	// thread safety sends
+ 	c.send.Lock()
+ 	defer c.send.Unlock()
+-	// setup data variables
+-	chunkSize, chunk := 0, []byte(nil)
++	if !c.transportV2 {
++		return c.writeLegacy(data)
++	}
+ 	// loop until no more data to send
+ 	for dataSize := len(data); dataSize > 0; dataSize = len(data) {
+-		// a 'buffer pool' saves resources by re-using buffers, take 2 buffers from the pool
+-		cipherTextBuffer, plainTextBuffer := pool.Get(crypto.EncryptedFrameSize), pool.Get(crypto.FrameSize)
+-		// if total data to write can be fit into a single chunk
+-		if dataSize < crypto.MaxDataSize {
+-			chunk = data
+-			data = nil
+-		} else { // else load the next chunk and save the rest of the data
+-			chunk = data[:crypto.MaxDataSize]
+-			data = data[crypto.MaxDataSize:]
+-		}
+-		chunkSize = len(chunk)
+-		// size of data is the first 4 bytes of the message
+-		binary.LittleEndian.PutUint32(plainTextBuffer, uint32(chunkSize))
+-		// the actual chunk comes after the first 4 bytes
+-		copy(plainTextBuffer[crypto.LengthHeaderSize:], chunk)
+-		// encrypt the plain text into the cipher buffer
+-		c.send.aead.Seal(cipherTextBuffer[:0], c.send.nonce[:], plainTextBuffer, nil)
++		chunkSize := min(dataSize, crypto.MaxDataSize)
++		chunk := data[:chunkSize]
++		data = data[chunkSize:]
++		// Authenticate the variable record length as AEAD associated data and bound it before receive-side allocation.
++		wireSize := crypto.LengthHeaderSize + chunkSize + crypto.Poly1305TagSize
++		wireBuffer := pool.Get(wireSize)
++		header := wireBuffer[:crypto.LengthHeaderSize]
++		binary.LittleEndian.PutUint32(header, uint32(chunkSize))
++		ciphertext := c.send.aead.Seal(wireBuffer[crypto.LengthHeaderSize:crypto.LengthHeaderSize], c.send.nonce[:], chunk, header)
+ 		// increment the 'write state' nonce to follow the security parameters of the AEAD protocol
+ 		incrementNonce(c.send.nonce)
+-		// write the cipher text to the underlying connection
+-		if _, er := c.conn.Write(cipherTextBuffer); er != nil {
++		// Complete any legal short write before advancing the nonce to preserve peer framing.
++		if er := writeAll(c.conn, wireBuffer[:crypto.LengthHeaderSize+len(ciphertext)]); er != nil {
++			pool.Put(wireBuffer)
+ 			return 0, ErrFailedWrite(er)
+ 		}
+ 		// update number of bytes written
+ 		n += chunkSize
+-		// release the buffers back into the pool for reuse
+-		pool.Put(cipherTextBuffer)
+-		pool.Put(plainTextBuffer)
++		pool.Put(wireBuffer)
+ 	}
+ 	return
+ }
+ 
++// writeLegacy() encrypts and writes data using fixed-size transport V1 records.
++func (c *EncryptedConn) writeLegacy(data []byte) (n int, err error) {
++	for len(data) != 0 {
++		chunkSize := min(len(data), crypto.LegacyMaxDataSize)
++		chunk := data[:chunkSize]
++		data = data[chunkSize:]
++		plainTextBuffer := pool.Get(crypto.LegacyFrameSize)
++		cipherTextBuffer := pool.Get(crypto.LegacyEncryptedFrameSize)
++		binary.LittleEndian.PutUint32(plainTextBuffer, uint32(chunkSize))
++		copy(plainTextBuffer[crypto.LengthHeaderSize:], chunk)
++		ciphertext := c.send.aead.Seal(cipherTextBuffer[:0], c.send.nonce[:], plainTextBuffer, nil)
++		incrementNonce(c.send.nonce)
++		if er := writeAll(c.conn, ciphertext); er != nil {
++			pool.Put(plainTextBuffer)
++			pool.Put(cipherTextBuffer)
++			return n, ErrFailedWrite(er)
++		}
++		n += chunkSize
++		pool.Put(plainTextBuffer)
++		pool.Put(cipherTextBuffer)
++	}
++	return n, nil
++}
++
+ // Read() checks the connection for cipher data bytes, if found,
+ // the func decrypts and loads them into the 'data' buffer
+ func (c *EncryptedConn) Read(data []byte) (n int, err error) {
+@@ -184,27 +219,31 @@ func (c *EncryptedConn) Read(data []byte) (n int, err error) {
+ 	if bzRead, hadUnread := c.checkUnread(data); hadUnread {
+ 		return bzRead, nil
+ 	}
+-	// a 'buffer pool' saves resources by re-using buffers, take 2 buffers from the pool
+-	cipherTextBuffer, plainTextBuffer := pool.Get(crypto.EncryptedFrameSize), pool.Get(crypto.FrameSize)
++	if !c.transportV2 {
++		return c.readLegacy(data)
++	}
++	// Read and bound the variable-size record before allocating its payload.
++	var header [crypto.LengthHeaderSize]byte
++	if _, er := io.ReadFull(c.conn, header[:]); er != nil {
++		return 0, er
++	}
++	chunkLength := binary.LittleEndian.Uint32(header[:])
++	if chunkLength == 0 || chunkLength > crypto.MaxDataSize {
++		return 0, ErrChunkLargerThanMax()
++	}
++	ciphertextSize := int(chunkLength) + crypto.Poly1305TagSize
++	cipherTextBuffer := pool.Get(ciphertextSize)
++	plainTextBuffer := pool.Get(int(chunkLength))
+ 	defer func() { pool.Put(plainTextBuffer); pool.Put(cipherTextBuffer) }()
+-	// load up bytes from the connection into the cipher text buffer
+ 	if _, er := io.ReadFull(c.conn, cipherTextBuffer); er != nil {
+ 		return 0, er
+ 	}
+-	// decrypt and load the cipher text buffer into the plain text buffer
+-	if _, er := c.receive.aead.Open(plainTextBuffer[:0], c.receive.nonce[:], cipherTextBuffer, nil); er != nil {
+-		return n, ErrConnDecryptFailed(er)
++	// Authenticate the length header so modification fails instead of changing the plaintext interpretation.
++	chunk, er := c.receive.aead.Open(plainTextBuffer[:0], c.receive.nonce[:], cipherTextBuffer, header[:])
++	if er != nil {
++		return 0, ErrConnDecryptFailed(er)
+ 	}
+-	// increment the 'read state' nonce to follow the security parameters of the AEAD protocol
+ 	incrementNonce(c.receive.nonce)
+-	// read the first 4 bytes to get the length of the chunk
+-	chunkLength := binary.LittleEndian.Uint32(plainTextBuffer) // read the length header
+-	// ensure it follows the max chunk sizing protocol
+-	if chunkLength > crypto.MaxDataSize {
+-		return 0, ErrChunkLargerThanMax()
+-	}
+-	// remove the first 4 bytes to get the chunk payload
+-	chunk := plainTextBuffer[crypto.LengthHeaderSize : crypto.LengthHeaderSize+chunkLength]
+ 	// load the chunk into the data buffer
+ 	n = copy(data, chunk)
+ 	// if the data buffer is smaller than the chunk, hold them in the 'unread buffer'
+@@ -213,6 +252,47 @@ func (c *EncryptedConn) Read(data []byte) (n int, err error) {
+ 	return
+ }
+ 
++// readLegacy() reads and decrypts fixed-size transport V1 records.
++func (c *EncryptedConn) readLegacy(data []byte) (n int, err error) {
++	cipherTextBuffer := pool.Get(crypto.LegacyEncryptedFrameSize)
++	plainTextBuffer := pool.Get(crypto.LegacyFrameSize)
++	defer func() { pool.Put(plainTextBuffer); pool.Put(cipherTextBuffer) }()
++	if _, er := io.ReadFull(c.conn, cipherTextBuffer); er != nil {
++		return 0, er
++	}
++	plainText, er := c.receive.aead.Open(plainTextBuffer[:0], c.receive.nonce[:], cipherTextBuffer, nil)
++	if er != nil {
++		return 0, ErrConnDecryptFailed(er)
++	}
++	incrementNonce(c.receive.nonce)
++	chunkLength := binary.LittleEndian.Uint32(plainText[:crypto.LengthHeaderSize])
++	if chunkLength > crypto.LegacyMaxDataSize {
++		return 0, ErrChunkLargerThanMax()
++	}
++	chunk := plainText[crypto.LengthHeaderSize : crypto.LengthHeaderSize+chunkLength]
++	n = copy(data, chunk)
++	c.holdUnread(n, chunk)
++	return n, nil
++}
++
++// TransportV2() reports whether this encrypted connection uses transport V2.
++func (c *EncryptedConn) TransportV2() bool { return c != nil && c.transportV2 }
++
++// writeAll() writes a complete transport record despite legal short writes.
++func writeAll(conn net.Conn, data []byte) error {
++	for len(data) != 0 {
++		n, err := conn.Write(data)
++		if err != nil {
++			return err
++		}
++		if n == 0 {
++			return io.ErrUnexpectedEOF
++		}
++		data = data[n:]
++	}
++	return nil
++}
++
+ // checkUnread() checks to see if the 'unread buffer' was filled from a partially read chunk
+ func (c *EncryptedConn) checkUnread(data []byte) (int, bool) {
+ 	if len(c.receive.unread) > 0 {
+diff --git a/p2p/encrypt_test.go b/p2p/encrypt_test.go
+index 92ac4f46..7b0931ab 100644
+--- a/p2p/encrypt_test.go
++++ b/p2p/encrypt_test.go
+@@ -1,49 +1,99 @@
+ package p2p
+ 
+ import (
++	"bytes"
++	"io"
+ 	"net"
+-	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/canopy-network/canopy/lib"
+ 	"github.com/canopy-network/canopy/lib/crypto"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// TestTransportV2Activation() verifies the configured hard-cutover activation behavior.
++func TestTransportV2Activation(t *testing.T) {
++	activation := time.Unix(2_000, 0)
++	require.False(t, transportV2ActiveAtUnix(activation, 0))
++	require.False(t, transportV2ActiveAtUnix(activation.Add(-time.Second), activation.Unix()))
++	require.True(t, transportV2ActiveAtUnix(activation, activation.Unix()))
++}
++
+ func TestEncryptedConn(t *testing.T) {
+ 	msg1, msg2 := []byte("foo"), []byte("bar")
+-	p1, err := crypto.NewBLS12381PrivateKey()
+-	require.NoError(t, err)
+-	p2, err := crypto.NewBLS12381PrivateKey()
+-	require.NoError(t, err)
+-	c1, c2 := net.Pipe()
+-	defer func() { c1.Close(); c2.Close() }()
+-	var e1, e2 *EncryptedConn
+-	wg := sync.WaitGroup{}
+-	wg.Add(1)
+-	go func() {
+-		e1, err = NewHandshake(c1, &lib.PeerMeta{ChainId: 1}, p1)
+-		wg.Done()
+-		require.NoError(t, err)
+-	}()
+-	e2, err = NewHandshake(c2, &lib.PeerMeta{ChainId: 1}, p2)
+-	require.NoError(t, err)
+-	wg.Wait()
+-	require.Equal(t, e1.Address.PublicKey, p2.PublicKey().Bytes())
+-	require.Equal(t, e2.Address.PublicKey, p1.PublicKey().Bytes())
++	e1, e2 := encryptedPipe(t)
++	defer func() { _ = e1.Close(); _ = e2.Close() }()
++	done := make(chan error, 1)
+ 	go func() {
+-		_, err = e1.Write(msg1)
+-		require.NoError(t, err)
++		_, err := e1.Write(msg1)
++		done <- err
+ 	}()
+ 	buff := make([]byte, 3)
+-	_, err = e2.Read(buff)
++	_, err := e2.Read(buff)
+ 	require.NoError(t, err)
++	require.NoError(t, <-done)
+ 	require.Equal(t, msg1, buff)
+ 	go func() {
+-		_, err = e2.Write(msg2)
+-		require.NoError(t, err)
++		_, err := e2.Write(msg2)
++		done <- err
+ 	}()
+ 	_, err = e1.Read(buff)
+ 	require.NoError(t, err)
++	require.NoError(t, <-done)
+ 	require.Equal(t, msg2, buff)
+ }
++
++// TestEncryptedConnVariableLengthRecords() verifies transport V2 handles variable-length encrypted records.
++func TestEncryptedConnVariableLengthRecords(t *testing.T) {
++	e1, e2 := encryptedPipe(t, true)
++	defer func() { _ = e1.Close(); _ = e2.Close() }()
++
++	payload := bytes.Repeat([]byte{0x5a}, crypto.MaxDataSize*3+17)
++	done := make(chan error, 1)
++	go func() {
++		_, err := e1.Write(payload)
++		done <- err
++	}()
++
++	got := make([]byte, len(payload))
++	_, err := io.ReadFull(e2, got)
++	require.NoError(t, err)
++	require.NoError(t, <-done)
++	require.Equal(t, payload, got)
++}
++
++// encryptedPipe() creates a connected encrypted transport pair for tests.
++func encryptedPipe(t *testing.T, forceTransportV2 ...bool) (*EncryptedConn, *EncryptedConn) {
++	t.Helper()
++	p1, err := crypto.NewBLS12381PrivateKey()
++	require.NoError(t, err)
++	p2, err := crypto.NewBLS12381PrivateKey()
++	require.NoError(t, err)
++	c1, c2 := net.Pipe()
++	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
++
++	result := make(chan *EncryptedConn, 1)
++	errs := make(chan error, 1)
++	transportV2 := false
++	if len(forceTransportV2) != 0 {
++		transportV2 = forceTransportV2[0]
++	}
++	go func() {
++		conn, errI := newHandshake(c1, &lib.PeerMeta{ChainId: 1}, p1, transportV2)
++		if errI != nil {
++			errs <- errI
++			return
++		}
++		result <- conn
++	}()
++	e2, errI := newHandshake(c2, &lib.PeerMeta{ChainId: 1}, p2, transportV2)
++	require.NoError(t, errI)
++	select {
++	case err = <-errs:
++		require.NoError(t, err)
++		return nil, nil
++	case e1 := <-result:
++		return e1, e2
++	}
++}
+diff --git a/p2p/error.go b/p2p/error.go
+index 179f47b5..ec59ff21 100644
+--- a/p2p/error.go
++++ b/p2p/error.go
+@@ -53,6 +53,11 @@ func ErrMaxMessageSize() lib.ErrorI {
+ 	return lib.NewError(lib.CodeMaxMessageSize, lib.P2PModule, "max message size")
+ }
+ 
++// ErrTransportCutover() reports a handshake that crossed the transport activation boundary.
++func ErrTransportCutover() lib.ErrorI {
++	return lib.NewError(lib.CodeFailedRead, lib.P2PModule, "transport V2 cutover")
++}
++
+ func ErrIsBlacklisted() lib.ErrorI {
+ 	return lib.NewError(lib.CodeBlacklisted, lib.P2PModule, "blacklisted man-in-the-middle id")
+ }
+diff --git a/p2p/p2p.go b/p2p/p2p.go
+index d4418f75..017e0c94 100644
+--- a/p2p/p2p.go
++++ b/p2p/p2p.go
+@@ -120,6 +120,34 @@ func (p *P2P) Start() {
+ 	go p.MonitorInboxStats(inboxMonitorInterval)
+ 	// Start dialing failed peers
+ 	go p.DialFailedPeers(dialFailedPeersInterval)
++	go p.scheduleTransportV2Cutover()
++}
++
++// scheduleTransportV2Cutover() closes V1 connections at activation so new handshakes select V2 without fallback.
++func (p *P2P) scheduleTransportV2Cutover() {
++	if TransportV2ActivationUnix == 0 {
++		return
++	}
++	activation := time.Unix(TransportV2ActivationUnix, 0)
++	wait := time.Until(activation)
++	if wait > 0 {
++		p.log.Warnf("Transport V2 hard cutover scheduled for %s", activation.UTC().Format(time.RFC3339))
++		timer := time.NewTimer(wait)
++		defer timer.Stop()
++		<-timer.C
++	}
++	p.log.Warn("Transport V2 cutover active; reconnecting V1 peers")
++	p.PeerSet.mux.RLock()
++	connections := make([]*MultiConn, 0, len(p.PeerSet.m))
++	for _, peer := range p.PeerSet.m {
++		if peer != nil && peer.conn != nil && !peer.conn.transportV2 {
++			connections = append(connections, peer.conn)
++		}
++	}
++	p.PeerSet.mux.RUnlock()
++	for _, connection := range connections {
++		connection.Error(ErrTransportCutover())
++	}
+ }
+ 
+ // Stop() stops the P2P service
+-- 
+2.50.1 (Apple Git-155)
+

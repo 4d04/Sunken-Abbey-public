@@ -1,0 +1,85 @@
+{
+  "time": "2026-11-04 12:48:29",
+  "accounts": [
+    {
+      "address": "87588a465b9dd20ac475295ad193501df4c8b714",
+      "amount": 1000000
+    },
+    {
+      "address": "cfd55e63b03ab8ea4affab919c13d0c2bfa408d0",
+      "amount": 400000000000000
+    },
+    {
+      "address": "f9c8148440b7b53dab13ce2004bba41e4c7adcb1",
+      "amount": 50000000000000
+    }
+  ],
+  "nonSigners": null,
+  "validators": [
+    {
+      "address": "87588a465b9dd20ac475295ad193501df4c8b714",
+      "publicKey": "b76166b545d467b579e34b25394c7117f31154a33046b594c450d205cbdc12979ff6bb7b4f9fcdded5acbb5118bb9340",
+      "committees": [
+        2
+      ],
+      "netAddress": "tcp://localhost",
+      "stakedAmount": 1000000000000,
+      "maxPausedHeight": 0,
+      "unstakingHeight": 0,
+      "output": "87588a465b9dd20ac475295ad193501df4c8b714",
+      "delegate": false,
+      "compound": true
+    }
+  ],
+  "params": {
+    "consensus": {
+      "blockSize": 1000000,
+      "protocolVersion": "1/0",
+      "rootChainID": 2,
+      "resetCommittee": 0
+    },
+    "validator": {
+      "unstakingBlocks": 2,
+      "maxPauseBlocks": 4380,
+      "doubleSignSlashPercentage": 10,
+      "nonSignSlashPercentage": 1,
+      "maxNonSign": 3,
+      "nonSignWindow": 5,
+      "maxCommittees": 15,
+      "maxCommitteeSize": 100,
+      "earlyWithdrawalPenalty": 20,
+      "delegateUnstakingBlocks": 2,
+      "minimumOrderSize": 1000000000,
+      "stakePercentForSubsidizedCommittee": 33,
+      "maxSlashPerCommittee": 15,
+      "delegateRewardPercentage": 10,
+      "buyDeadlineBlocks": 60,
+      "lockOrderFeeMultiplier": 2,
+      "minimumStakeForValidators": 0,
+      "minimumStakeForDelegates": 0,
+      "maximumDelegatesPerCommittee": 0
+    },
+    "fee": {
+      "sendFee": 10000,
+      "stakeFee": 10000,
+      "editStakeFee": 10000,
+      "unstakeFee": 10000,
+      "pauseFee": 10000,
+      "unpauseFee": 10000,
+      "changeParameterFee": 10000,
+      "daoTransferFee": 10000,
+      "certificateResultsFee": 0,
+      "subsidyFee": 10000,
+      "createOrderFee": 10000,
+      "editOrderFee": 10000,
+      "deleteOrderFee": 10000,
+      "dexLimitOrderFee": 0,
+      "dexLiquidityDeposit": 0,
+      "dexLiquidityWithdraw": 0
+    },
+    "governance": {
+      "daoRewardPercentage": 5
+    }
+  },
+  "supply": null
+}
