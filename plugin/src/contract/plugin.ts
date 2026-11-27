@@ -3,6 +3,7 @@
 import * as net from 'net';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { readFileSync } from 'fs';
 import Long from 'long';
 
 import { types } from '../proto/types.js';
@@ -59,11 +60,29 @@ export interface Config {
     rpcAddress: string;
 }
 
+/**
+ * The chain id this plugin runs on (the template hard-codes 1; a nested chain needs its own id for fee-pool keys and tx
+ * checks). ABBEY_CHAIN_ID wins if set; otherwise it is read from the node's own config.json, which the core points to by
+ * starting the plugin with CANOPY_PLUGIN_HOME=<data dir>/plugin/<name> (controller.go, lib/config.go PluginHome). That
+ * covers a node whose config is generated for us (Canopy's graduation pipeline). Falls back to 1.
+ */
+export function chainIdFromNode(env: Record<string, string | undefined> = process.env): number {
+    if (env.ABBEY_CHAIN_ID) return Number(env.ABBEY_CHAIN_ID);
+    if (env.CANOPY_PLUGIN_HOME) {
+        try {
+            const c = JSON.parse(readFileSync(path.join(env.CANOPY_PLUGIN_HOME, '..', '..', 'config.json'), 'utf-8'));
+            if (Number.isInteger(c.chainId) && c.chainId > 0) return c.chainId;
+        } catch {
+            // no readable config.json: fall through to the default
+        }
+    }
+    return 1;
+}
+
 // DefaultConfig() returns the default configuration
 export function DefaultConfig(): Config {
     return {
-        // the template hard-codes 1; a nested chain needs its own id for fee-pool keys
-        ChainId: Number(process.env.ABBEY_CHAIN_ID || 1),
+        ChainId: chainIdFromNode(),
         // must match the core's socket folder (CANOPY_PLUGIN_SOCKET_DIR, spike/plugin-socket-dir.patch; default /tmp/plugin)
         DataDirPath: process.env.CANOPY_PLUGIN_SOCKET_DIR || '/tmp/plugin/',
         rpcAddress: '127.0.0.1:50010'
